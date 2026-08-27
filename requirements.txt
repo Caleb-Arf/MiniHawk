@@ -1,0 +1,5 @@
+flet==0.83.0
+flet-charts==0.83.0
+pymavlink
+srtm.py
+scipy

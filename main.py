@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
+from collections import deque
 
 import matplotlib
 matplotlib.use("Agg")
@@ -23,6 +24,8 @@ from mpl_toolkits.mplot3d import Axes3D
 MAX_POINTS = 50
 THEME_FILE = Path(__file__).with_name("theme.json")
 CONFIG_FILE = Path(__file__).with_name("config.json")
+AUTOSAVE_FILE = Path(__file__).with_name("telemetry_latest.csv")
+AUTOSAVE_INTERVAL = 5.0  # seconds between auto-saves
 
 DEFAULT_CONFIG = {
     "mavlink_bind_host": "0.0.0.0",
@@ -239,6 +242,8 @@ class TerrainCache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         import srtm
         self.elev = srtm.get_data(local_cache_dir=str(self.cache_dir))
+        self._last_grid_key = None
+        self._last_grid_data = (None, None, None)
 
     def get_elevations(self, lats: list, lons: list) -> list:
         """Bulk elevation query. Returns list with None for missing data."""
@@ -246,6 +251,11 @@ class TerrainCache:
 
     def get_elevation_grid(self, lat_min, lat_max, lon_min, lon_max, resolution=50):
         """Return (X, Y, Z) meshgrid arrays for Matplotlib plot_surface."""
+        # Quantize bounding box to ~100m to reuse cached mesh during slow movement or stationary flights
+        grid_key = (round(lat_min, 3), round(lat_max, 3), round(lon_min, 3), round(lon_max, 3), resolution)
+        if grid_key == self._last_grid_key and self._last_grid_data[0] is not None:
+            return self._last_grid_data
+
         import builtins
         _orig_print = builtins.print
         def _quiet_print(*args, **kwargs):
@@ -290,6 +300,9 @@ class TerrainCache:
                     method="nearest",
                 )
                 z_grid = np.where(np.isnan(z_grid), z_grid_nn, z_grid)
+
+            self._last_grid_key = grid_key
+            self._last_grid_data = (lon_grid, lat_grid, z_grid)
             return lon_grid, lat_grid, z_grid
         finally:
             builtins.print = _orig_print
@@ -413,7 +426,7 @@ def _render_3d_scatter(data_list, width_px, height_px, theme_ref, is_dark_ref):
         X, Y, Z = TERRAIN_CACHE.get_elevation_grid(
             lat_min - lat_pad, lat_max + lat_pad,
             lon_min - lon_pad, lon_max + lon_pad,
-            resolution=80,
+            resolution=50,
         )
         terrain_available = X is not None
     except Exception:
@@ -425,7 +438,7 @@ def _render_3d_scatter(data_list, width_px, height_px, theme_ref, is_dark_ref):
             X, Y, Z,
             cmap="gist_earth",
             alpha=0.85,
-            rcount=80, ccount=80,
+            rcount=50, ccount=50,
             linewidth=0, antialiased=False,
         )
         alt_shift = float(alts.min()) - z_min_surf
@@ -502,24 +515,28 @@ async def main(page: ft.Page):
     config = load_config()
     restart_event = asyncio.Event()
 
-    # --- Throttled UI refresh ---
-    UI_REFRESH_INTERVAL = 0.2  # 200 ms max
+    # --- Dirty flags for high-frequency decoupled render loop ---
+    dirty_charts = set()
+    dirty_gps = [False]
+    dirty_rate = [False]
+    dirty_conn = [False]
+    dirty_table = [False]
+
+    # --- Safe debounced page update for modals / settings / theme toggles ---
     _ui_refresh_pending = [False]
-    _last_ui_refresh = [0.0]
 
     def schedule_ui_refresh():
-        """Queue a page update; debounced to at most 5 Hz."""
-        now = time.time()
-        if now - _last_ui_refresh[0] < UI_REFRESH_INTERVAL:
-            return
+        """Queue a page update for dialogs and structural changes safely."""
         if not _ui_refresh_pending[0]:
             _ui_refresh_pending[0] = True
-            asyncio.get_event_loop().call_later(UI_REFRESH_INTERVAL, _do_ui_refresh)
+            asyncio.get_event_loop().call_soon(_do_ui_refresh)
 
     def _do_ui_refresh():
         _ui_refresh_pending[0] = False
-        _last_ui_refresh[0] = time.time()
-        page.update()
+        try:
+            page.update()
+        except Exception:
+            pass
 
     page.theme_mode = ft.ThemeMode.DARK if is_dark else ft.ThemeMode.LIGHT
     page.bgcolor = theme["page_bg"]
@@ -554,7 +571,6 @@ async def main(page: ft.Page):
     )
 
     # --- Theme application helpers ---
-    # Containers we need to mutate when theme toggles
     chart_cards = []           # CO2, HUM, TEMP, scatter
     georef_panel_ref = [None]
     log_container_ref = [None]
@@ -608,42 +624,29 @@ async def main(page: ft.Page):
         n_points = len(gps_co2_data)
 
         if n_points == 0:
-            scatter_container.content = ft.Column([
-                ft.Text("GPS/CO2 3D Terrain", size=11, weight="bold", color=t["text_cyan"]),
-                ft.Container(
-                    content=ft.Text("No data", color=t["scatter_no_data"]),
-                    expand=True,
-                    border=ft.Border.all(1, t["axis_color"]),
-                ),
-            ], spacing=5)
+            scatter_img.visible = False
+            scatter_placeholder.visible = True
+            scatter_box.border = ft.Border.all(1, t["axis_color"])
+            try:
+                scatter_container.update()
+            except Exception:
+                pass
             return
 
-        src = render_3d_scatter(gps_co2_data, 1100, 500)
+        src = render_3d_scatter(gps_co2_data, 900, 820)
         if src:
-            img = ft.Image(src=src, fit="contain", expand=True)
-            scatter_container.content = ft.Column([
-                ft.Row([
-                    ft.Text("GPS/CO2 3D Terrain", size=11, weight="bold", color=t["text_cyan"], expand=True),
-                    ft.IconButton(
-                        icon=ft.Icons.FULLSCREEN,
-                        icon_size=14,
-                        tooltip="Maximize",
-                        on_click=create_scatter_maximize_handler(),
-                        padding=ft.Padding.all(4),
-                    ),
-                ], tight=True),
-                ft.Container(
-                    content=img,
-                    alignment=ft.alignment.Alignment.CENTER,
-                    expand=True,
-                    border=ft.Border.all(1, t["axis_color"]),
-                ),
-            ], spacing=5)
+            scatter_img.src = src
+            scatter_img.visible = True
+            scatter_placeholder.visible = False
+            scatter_box.border = ft.Border.all(1, t["axis_color"])
+            try:
+                scatter_container.update()
+            except Exception:
+                pass
 
     def update_scatter_plot_sync():
-        """Synchronous caller — blocks the asyncio loop; use only for theme toggles / dialogs."""
+        """Synchronous caller — use for theme toggles / dialogs."""
         update_scatter_plot()
-        schedule_ui_refresh()
 
     async def _update_scatter_plot_async():
         """Non-blocking: run Matplotlib + SRTM in a thread, then update the widget."""
@@ -653,77 +656,64 @@ async def main(page: ft.Page):
         is_dark_copy = bool(is_dark)
 
         if len(data_copy) == 0:
-            scatter_container.content = ft.Column([
-                ft.Text("GPS/CO2 3D Terrain", size=11, weight="bold", color=t["text_cyan"]),
-                ft.Container(
-                    content=ft.Text("No data", color=t["scatter_no_data"]),
-                    expand=True,
-                    border=ft.Border.all(1, t["axis_color"]),
-                ),
-            ], spacing=5)
-            schedule_ui_refresh()
+            scatter_img.visible = False
+            scatter_placeholder.visible = True
+            try:
+                scatter_container.update()
+            except Exception:
+                pass
             return
 
         # Run heavy Matplotlib + SRTM in a thread pool
         loop = asyncio.get_event_loop()
         try:
             src = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
+                loop.run_in_executor(
                     None,
                     _render_3d_scatter,
                     data_copy,
-                    1100,
-                    500,
+                    900,
+                    820,
                     theme_copy,
                     is_dark_copy,
                 ),
                 timeout=10.0,
             )
-        except asyncio.TimeoutError:
-            return
         except Exception:
             return
 
         if src:
-            scatter_container.content = ft.Column([
-                ft.Row([
-                    ft.Text("GPS/CO2 3D Terrain", size=11, weight="bold", color=t["text_cyan"], expand=True),
-                    ft.IconButton(
-                        icon=ft.Icons.FULLSCREEN,
-                        icon_size=14,
-                        tooltip="Maximize",
-                        on_click=create_scatter_maximize_handler(),
-                        padding=ft.Padding.all(4),
-                    ),
-                ], tight=True),
-                ft.Container(
-                    content=ft.Image(src=src, fit="contain", expand=True),
-                    alignment=ft.alignment.Alignment.CENTER,
-                    expand=True,
-                    border=ft.Border.all(1, t["axis_color"]),
-                ),
-            ], spacing=5)
-            schedule_ui_refresh()
+            scatter_img.src = src
+            scatter_img.visible = True
+            scatter_placeholder.visible = False
+            try:
+                scatter_container.update()
+            except Exception:
+                pass
 
-
-    # --- Chart factory for line charts ---
-    def make_chart(color, on_event):
+    # --- Chart factory for grouped line charts ---
+    def make_chart(colors, on_event):
         t = theme
-        series = fch.LineChartData(
-            color=color,
-            stroke_width=2,
-            curved=True,
-            rounded_stroke_cap=True,
-            points=[fch.LineChartDataPoint(x=0, y=0, show_tooltip=False)],
-        )
+        if not isinstance(colors, (list, tuple)):
+            colors = [colors]
+        series = [
+            fch.LineChartData(
+                color=color,
+                stroke_width=2,
+                curved=True,
+                rounded_stroke_cap=True,
+                points=[],
+            )
+            for color in colors
+        ]
         chart = fch.LineChart(
-            data_series=[series],
+            data_series=series,
             expand=True,
             min_x=0,
             max_x=MAX_POINTS,
             min_y=-1,
             max_y=1,
-            animation=50,
+            animation=0,
             on_event=on_event,
             horizontal_grid_lines=fch.ChartGridLines(
                 interval=0.5, color=t["grid_color"], width=1,
@@ -769,6 +759,32 @@ async def main(page: ft.Page):
                 pass
         return handler
 
+    def make_group_on_event(georef_lists: list[list]):
+        """Show GPS data for the hovered series; older Flet versions fall back to the first one."""
+        def handler(e: fch.LineChartEvent):
+            try:
+                if not e.spots:
+                    return
+                spot = e.spots[0]
+                point_index = spot.spot_index if hasattr(spot, "spot_index") else spot[1]
+                series_index = next(
+                    (getattr(spot, attr) for attr in ("series_index", "bar_index", "data_set_index")
+                     if hasattr(spot, attr)),
+                    0,
+                )
+                georef_list = georef_lists[int(series_index)] if 0 <= int(series_index) < len(georef_lists) else georef_lists[0]
+                if 0 <= point_index < len(georef_list):
+                    d = georef_list[point_index]
+                    georef_val.value = f"{d['val']:.4f}"
+                    georef_val.color = theme["text_primary"]
+                    georef_lat.value = f"{d['lat']:.5f}°"
+                    georef_lon.value = f"{d['lon']:.5f}°"
+                    georef_alt.value = f"↑ {d['alt']:.1f}m"
+                    georef_panel_ref[0].update()
+            except Exception:
+                pass
+        return handler
+
     # --- Async scatter render task ---
     _scatter_render_task = [None]
 
@@ -779,46 +795,94 @@ async def main(page: ft.Page):
     so2_georef: list = []
     co2fine_georef: list = []
 
-    co2_series, co2_chart = make_chart(ft.Colors.PURPLE_400, make_on_event(co2_georef))
+    # Tres paneles: pares con escalas comparables comparten el mismo eje vertical.
+    climate_series, climate_chart = make_chart(
+        [ft.Colors.GREEN_400, ft.Colors.ORANGE_400], make_group_on_event([hum_georef, temp_georef])
+    )
+    gas_series, gas_chart = make_chart(
+        [ft.Colors.YELLOW_400, ft.Colors.RED_400], make_group_on_event([h2s_georef, so2_georef])
+    )
+    co2_series, co2_chart = make_chart(
+        [ft.Colors.PURPLE_400, ft.Colors.CYAN_400], make_group_on_event([co2_georef, co2fine_georef])
+    )
     hum_series, hum_chart = make_chart(ft.Colors.GREEN_400, make_on_event(hum_georef))
     temp_series, temp_chart = make_chart(ft.Colors.ORANGE_400, make_on_event(temp_georef))
     h2s_series, h2s_chart = make_chart(ft.Colors.YELLOW_400, make_on_event(h2s_georef))
     so2_series, so2_chart = make_chart(ft.Colors.RED_400, make_on_event(so2_georef))
     co2fine_series, co2fine_chart = make_chart(ft.Colors.CYAN_400, make_on_event(co2fine_georef))
+    # Dedicated CO2 panel used in the individual view.
+    co2_individual_series, co2_individual_chart = make_chart(ft.Colors.PURPLE_400, make_on_event(co2_georef))
+    detail_series, detail_chart = make_chart(ft.Colors.PURPLE_400, make_on_event(co2_georef))
 
-    charts_refs.extend([(co2_series, co2_chart), (hum_series, hum_chart), (temp_series, temp_chart),
-                        (h2s_series, h2s_chart), (so2_series, so2_chart), (co2fine_series, co2fine_chart)])
+    charts_refs.extend([
+        (climate_series, climate_chart),
+        (gas_series, gas_chart),
+        (co2_series, co2_chart),
+        (hum_series, hum_chart),
+        (temp_series, temp_chart),
+        (h2s_series, h2s_chart),
+        (so2_series, so2_chart),
+        (co2fine_series, co2fine_chart),
+        (co2_individual_series, co2_individual_chart),
+        (detail_series, detail_chart),
+    ])
 
-    def chart_card(label, color, chart, maximize_action=None, config_action=None):
+    def chart_card(label, color, chart, maximize_action=None, config_action=None, compact_height=None, on_tap=None):
         t = theme
-        title_row = ft.Row([
-            ft.Text(label, size=11, weight="bold", color=color, expand=True),
-            ft.IconButton(
+        config_buttons = []
+        if callable(config_action):
+            config_buttons.append(ft.IconButton(
                 icon=ft.Icons.TUNE,
                 icon_size=14,
                 tooltip="Configure bands",
                 on_click=config_action,
                 padding=ft.Padding.all(4),
                 icon_color=color,
-            ) if config_action else ft.Container(),
-            ft.IconButton(
+            ))
+        elif config_action:
+            for sensor_label, sensor_color, action in config_action:
+                config_buttons.append(ft.IconButton(
+                    icon=ft.Icons.TUNE,
+                    icon_size=14,
+                    tooltip=f"Configure bands: {sensor_label}",
+                    on_click=action,
+                    padding=ft.Padding.all(4),
+                    icon_color=sensor_color,
+                ))
+
+        title_controls = [
+            ft.Text(label, size=11, weight="bold", color=color, expand=True),
+            *config_buttons,
+        ]
+        if on_tap:
+            title_controls.append(ft.IconButton(
+                icon=ft.Icons.OPEN_IN_NEW,
+                icon_size=14,
+                tooltip="Open detailed chart",
+                on_click=on_tap,
+                padding=ft.Padding.all(4),
+                icon_color=color,
+            ))
+        if maximize_action:
+            title_controls.append(ft.IconButton(
                 icon=ft.Icons.FULLSCREEN,
                 icon_size=14,
                 tooltip="Maximize",
                 on_click=maximize_action,
                 padding=ft.Padding.all(4),
-            ) if maximize_action else ft.Container(),
-        ], tight=True)
+            ))
+        title_row = ft.Row(title_controls, tight=True)
         c = ft.Container(
             content=ft.Column([
                 title_row,
                 chart,
             ], spacing=0, expand=True),
-        height=420,
+            height=compact_height if compact_height else 420,
             bgcolor=t["card_bg"],
             padding=ft.Padding.symmetric(horizontal=10, vertical=8),
             border_radius=10,
             expand=True,
+            on_click=on_tap,
         )
         chart_cards.append(c)
         return c
@@ -832,25 +896,25 @@ async def main(page: ft.Page):
             schedule_ui_refresh()
 
         def handler(e):
-            live_series = chart.data_series[0] if chart.data_series else None
-            pts = list(live_series.points) if live_series else []
+            live_series = list(chart.data_series or [])
             dlg_chart = fch.LineChart(
                 data_series=[
                     fch.LineChartData(
-                        color=live_series.color if live_series else color,
+                        color=source.color,
                         stroke_width=3,
                         curved=True,
                         rounded_stroke_cap=True,
-                        points=pts,
+                        points=list(source.points),
                     )
+                    for source in live_series
                 ],
                 expand=True,
                 min_x=chart.min_x,
                 max_x=chart.max_x,
                 min_y=chart.min_y,
                 max_y=chart.max_y,
-                animation=50,
-                on_event=make_on_event(georef),
+                animation=0,
+                on_event=chart.on_event,
                 horizontal_grid_lines=fch.ChartGridLines(
                     interval=chart.horizontal_grid_lines.interval,
                     color=theme["grid_color"], width=1,
@@ -906,23 +970,18 @@ async def main(page: ft.Page):
 
     # --- Scatter ---
     gps_co2_data = []
-    scatter_container = ft.Container(
-        content=ft.Column([
-            ft.Text("GPS/CO2 3D Terrain", size=11, weight="bold", color=theme["text_cyan"]),
-            ft.Container(
-                content=ft.Text("No data", color=theme["scatter_no_data"]),
-                expand=True,
-                border=ft.Border.all(1, theme["axis_color"]),
-            ),
-        ], spacing=5),
-        height=300,
-        bgcolor=theme["card_bg"],
-        padding=15,
-        border_radius=10,
+    scatter_img = ft.Image(src="", fit="contain", expand=True, visible=False)
+    scatter_placeholder = ft.Container(
+        content=ft.Text("No data", color=theme["scatter_no_data"]),
         expand=True,
+        alignment=ft.alignment.Alignment.CENTER,
     )
-    chart_cards.append(scatter_container)
-
+    scatter_box = ft.Container(
+        content=ft.Stack([scatter_placeholder, scatter_img], expand=True),
+        alignment=ft.alignment.Alignment.CENTER,
+        expand=True,
+        border=ft.Border.all(1, theme["axis_color"]),
+    )
     def create_scatter_maximize_handler():
         def close_dlg(e):
             if scatter_dlg_ref[0]:
@@ -960,9 +1019,50 @@ async def main(page: ft.Page):
             schedule_ui_refresh()
         return handler
 
+    scatter_container = ft.Container(
+        content=ft.Column([
+            ft.Row([
+                ft.Text("GPS/CO2 3D Terrain", size=11, weight="bold", color=theme["text_cyan"], expand=True),
+                ft.IconButton(
+                    icon=ft.Icons.FULLSCREEN,
+                    icon_size=14,
+                    tooltip="Maximize",
+                    on_click=create_scatter_maximize_handler(),
+                    padding=ft.Padding.all(4),
+                ),
+            ], tight=True),
+            scatter_box,
+        ], spacing=5),
+        height=300,
+        bgcolor=theme["card_bg"],
+        padding=15,
+        border_radius=10,
+        expand=True,
+    )
+    chart_cards.append(scatter_container)
+
 
     # --- Log (moved to a dialog window) ---
+    log_entries = deque(maxlen=200)
     log_view = ft.ListView(expand=True, spacing=4, auto_scroll=True)
+
+    def populate_log_view():
+        log_view.controls = [
+            ft.Text(msg, size=10, color=col)
+            for msg, col in log_entries
+        ]
+
+    def add_log_message(msg: str, color=None):
+        col = color if color is not None else theme["text_secondary"]
+        log_entries.append((msg, col))
+        if getattr(log_dialog, "open", False):
+            log_view.controls.append(ft.Text(msg, size=10, color=col))
+            if len(log_view.controls) > 120:
+                log_view.controls.pop(0)
+            try:
+                log_view.update()
+            except Exception:
+                pass
 
     log_dialog = ft.AlertDialog(
         modal=True,
@@ -987,6 +1087,7 @@ async def main(page: ft.Page):
 
     # --- Log button ---
     def toggle_log_dialog(e):
+        populate_log_view()
         log_dialog.open = True
         schedule_ui_refresh()
 
@@ -996,10 +1097,11 @@ async def main(page: ft.Page):
         on_click=toggle_log_dialog,
     )
 
-    # --- Raw Data Table Dialog ---
+    # --- Raw Data Table (persistent dashboard tab) ---
     def build_data_table():
         columns = [
-            ft.DataColumn(ft.Text("Time", size=10, color=theme["text_primary"])),
+            ft.DataColumn(ft.Text("Timestamp", size=10, color=theme["text_primary"])),
+            ft.DataColumn(ft.Text("Hora", size=10, color=theme["text_primary"])),
             ft.DataColumn(ft.Text("Sensor", size=10, color=theme["text_primary"])),
             ft.DataColumn(ft.Text("Value", size=10, color=theme["text_primary"])),
             ft.DataColumn(ft.Text("Lat", size=10, color=theme["text_primary"])),
@@ -1007,11 +1109,13 @@ async def main(page: ft.Page):
             ft.DataColumn(ft.Text("Alt", size=10, color=theme["text_primary"])),
         ]
         rows = []
-        for row in telemetry_history[-100:]:
+        for row in telemetry_history[-250:]:
+            timestamp = row["timestamp"]
             rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(datetime.now().strftime("%H:%M:%S"), size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(timestamp, size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(timestamp.split(" ")[-1], size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(row["name"], size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['value']:.3f}", size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['lat']:.5f}", size=9, color=theme["text_secondary"])),
@@ -1029,20 +1133,6 @@ async def main(page: ft.Page):
             horizontal_lines=ft.border.BorderSide(1, theme["grid_color"]),
             heading_row_color=ft.Colors.with_opacity(0.1, theme["label_color"]),
         )
-
-    def show_table_dialog(e):
-        table = build_data_table()
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Telemetry Data Table", size=14, weight="bold", color=theme["text_primary"]),
-            content=ft.ListView(controls=[table], expand=True, height=500, width=700),
-            bgcolor=theme["card_bg"],
-            actions=[ft.TextButton("Close", on_click=lambda e: [setattr(dlg, "open", False), schedule_ui_refresh()])],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        page.overlay.append(dlg)
-        dlg.open = True
-        schedule_ui_refresh()
 
     def show_band_config(sensor_key):
         """Open a dialog to configure color bands for a sensor."""
@@ -1154,12 +1244,6 @@ async def main(page: ft.Page):
         page.overlay.append(dlg)
         dlg.open = True
         schedule_ui_refresh()
-
-    table_btn = ft.IconButton(
-        icon=ft.Icons.TABLE_ROWS,
-        tooltip="View Data Table",
-        on_click=show_table_dialog,
-    )
 
     # --- File manager helper ---
     def _open_file_manager(path: Path):
@@ -1276,6 +1360,7 @@ async def main(page: ft.Page):
         # Update chart styles
         apply_chart_themes()
         update_scatter_plot()
+        refresh_table_view()
 
         # Update theme button icon
         btn = theme_btn_ref[0]
@@ -1369,7 +1454,7 @@ async def main(page: ft.Page):
 
         progress_bar = ft.ProgressBar(value=0, width=300, visible=False)
         status_text = ft.Text("", size=11, color=t["text_secondary"])
-        preview_img = ft.Image(src=None, fit="contain", expand=True, visible=False)
+        preview_img = ft.Image(src="", fit="contain", expand=True, visible=False)
         tiles_list = ft.ListView(expand=True, height=180, spacing=2)
         cancel_flag = {"do_cancel": False}
 
@@ -1578,6 +1663,133 @@ async def main(page: ft.Page):
         on_click=show_offline_download_dialog,
     )
 
+    GRID_CARD_HEIGHT = 230
+    GRID_TOTAL_HEIGHT = GRID_CARD_HEIGHT * 3 + 20
+    detail_selection = ["CO2"]
+    dashboard_tab_index = [0]
+    detail_heading = ft.Text("CO₂ (ppm)", size=16, weight="bold", color=ft.Colors.PURPLE_400)
+
+    sensor_view_meta = {
+        "CO2": ("CO₂ (ppm)", ft.Colors.PURPLE_400, co2_georef),
+        "CO2_FINE": ("CO₂ Fine (ppm)", ft.Colors.CYAN_400, co2fine_georef),
+        "HUMIDITY": ("HUMIDITY (%)", ft.Colors.GREEN_400, hum_georef),
+        "TEMPERATURE": ("TEMPERATURE (°C)", ft.Colors.ORANGE_400, temp_georef),
+        "H2S": ("H2S (ppm)", ft.Colors.YELLOW_400, h2s_georef),
+        "SO2": ("SO₂ (ppm)", ft.Colors.RED_400, so2_georef),
+    }
+
+    def open_sensor_detail(sensor_name):
+        def handler(e):
+            label, color, georef = sensor_view_meta[sensor_name]
+            detail_selection[0] = sensor_name
+            dashboard_tab_index[0] = 1
+            detail_heading.value = label
+            detail_heading.color = color
+            detail_chart.on_event = make_on_event(georef)
+            chart_sensor_names[id(detail_chart)] = [sensor_name]
+            _rebuild_chart_series(detail_chart)
+            dashboard_tabs.selected_index = 1
+            try:
+                dashboard_tabs.update()
+            except Exception:
+                schedule_ui_refresh()
+        return handler
+
+    individual_cards = [
+        chart_card("CO₂ (ppm)", ft.Colors.PURPLE_400, co2_individual_chart,
+                   create_maximize_handler("CO₂ (ppm)", ft.Colors.PURPLE_400, co2_individual_chart, co2_georef),
+                   [("CO₂", ft.Colors.PURPLE_400, lambda e: show_band_config("CO2"))],
+                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("CO2")),
+        chart_card("CO₂ Fine (ppm)", ft.Colors.CYAN_400, co2fine_chart,
+                   create_maximize_handler("CO₂ Fine (ppm)", ft.Colors.CYAN_400, co2fine_chart, co2fine_georef),
+                   [("CO₂ Fine", ft.Colors.CYAN_400, lambda e: show_band_config("CO2_FINE"))],
+                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("CO2_FINE")),
+        chart_card("HUMIDITY (%)", ft.Colors.GREEN_400, hum_chart,
+                   create_maximize_handler("Humidity (%)", ft.Colors.GREEN_400, hum_chart, hum_georef),
+                   [("Humidity", ft.Colors.GREEN_400, lambda e: show_band_config("HUMIDITY"))],
+                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("HUMIDITY")),
+        chart_card("TEMPERATURE (°C)", ft.Colors.ORANGE_400, temp_chart,
+                   create_maximize_handler("Temperature (°C)", ft.Colors.ORANGE_400, temp_chart, temp_georef),
+                   [("Temperature", ft.Colors.ORANGE_400, lambda e: show_band_config("TEMPERATURE"))],
+                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("TEMPERATURE")),
+        chart_card("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart,
+                   create_maximize_handler("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart, h2s_georef),
+                   [("H2S", ft.Colors.YELLOW_400, lambda e: show_band_config("H2S"))],
+                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("H2S")),
+        chart_card("SO₂ (ppm)", ft.Colors.RED_400, so2_chart,
+                   create_maximize_handler("SO₂ (ppm)", ft.Colors.RED_400, so2_chart, so2_georef),
+                   [("SO₂", ft.Colors.RED_400, lambda e: show_band_config("SO2"))],
+                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("SO2")),
+    ]
+
+    detail_card = chart_card(
+        "Vista ampliada", ft.Colors.PURPLE_400, detail_chart,
+        create_maximize_handler("Vista ampliada", ft.Colors.PURPLE_400, detail_chart, co2_georef),
+    )
+
+    def on_dashboard_tab_change(e):
+        dashboard_tab_index[0] = e.control.selected_index
+        active_charts = (
+            [co2_individual_chart, co2fine_chart, hum_chart, temp_chart, h2s_chart, so2_chart]
+            if dashboard_tab_index[0] == 0 else [detail_chart]
+        )
+        for c in active_charts:
+            refresh_secondary_chart(c)
+        try:
+            for c in active_charts:
+                c.update()
+        except Exception:
+            schedule_ui_refresh()
+
+    table_view = ft.ListView(expand=True, spacing=0)
+
+    def refresh_table_view():
+        """Rebuild the Excel-style table from the most recent telemetry."""
+        table_view.controls = [
+            ft.Row([build_data_table()], scroll=ft.ScrollMode.AUTO),
+        ]
+
+    refresh_table_view()
+
+    scatter_container.height = GRID_TOTAL_HEIGHT
+    grid_view = ft.Column([
+        ft.Row([
+            ft.Column([
+                ft.Row([individual_cards[0], individual_cards[1]], spacing=10, height=GRID_CARD_HEIGHT),
+                ft.Row([individual_cards[2], individual_cards[3]], spacing=10, height=GRID_CARD_HEIGHT),
+                ft.Row([individual_cards[4], individual_cards[5]], spacing=10, height=GRID_CARD_HEIGHT),
+            ], spacing=10, expand=True),
+            scatter_container,
+        ], spacing=10, height=GRID_TOTAL_HEIGHT),
+    ], expand=True, scroll=ft.ScrollMode.AUTO)
+    individual_view = ft.Column([
+        detail_heading,
+        ft.Text("Haz clic en cualquier gráfica de la cuadrícula para mostrarla aquí.",
+                size=11, color=theme["text_secondary"]),
+        detail_card,
+    ], spacing=8, expand=True)
+    data_view = ft.Column([
+        ft.Text("Datos de telemetría", size=16, weight="bold", color=theme["text_primary"]),
+        ft.Text("Últimas 250 muestras recibidas. Desplázate horizontalmente para ver todas las columnas.",
+                size=11, color=theme["text_secondary"]),
+        table_view,
+    ], spacing=8, expand=True)
+    dashboard_tabs = ft.Tabs(
+        length=3,
+        selected_index=0,
+        animation_duration=200,
+        on_change=on_dashboard_tab_change,
+        content=ft.Column([
+            ft.TabBar(tabs=[
+                ft.Tab(label="Cuadrícula", icon=ft.Icons.GRID_VIEW),
+                ft.Tab(label="Detalle", icon=ft.Icons.SHOW_CHART),
+                ft.Tab(label="Datos", icon=ft.Icons.TABLE_ROWS),
+            ]),
+            ft.TabBarView(controls=[grid_view, individual_view, data_view], expand=True),
+        ], expand=True, spacing=0),
+        expand=True,
+    )
+
     # --- Build Page ---
     page.remove(loading_container)
     page.add(
@@ -1603,7 +1815,6 @@ async def main(page: ft.Page):
                     ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ], spacing=0, alignment=ft.MainAxisAlignment.CENTER),
                 ft.FilledButton("Export CSV", icon=ft.Icons.SAVE_ALT, on_click=download_csv),
-                table_btn,
                 log_btn,
                 offline_btn,
                 theme_btn,
@@ -1618,25 +1829,93 @@ async def main(page: ft.Page):
             ], spacing=12),
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
 
-        ft.Row([
-            ft.Column([
-                chart_card("CO2 (ppm)", ft.Colors.PURPLE_400, co2_chart, create_maximize_handler("CO2 (ppm)", ft.Colors.PURPLE_400, co2_chart, co2_georef), lambda e: show_band_config("CO2")),
-                chart_card("HUMIDITY (%)", ft.Colors.GREEN_400, hum_chart, create_maximize_handler("HUMIDITY (%)", ft.Colors.GREEN_400, hum_chart, hum_georef), lambda e: show_band_config("HUMIDITY")),
-                chart_card("TEMPERATURE (°C)", ft.Colors.ORANGE_400, temp_chart, create_maximize_handler("TEMPERATURE (°C)", ft.Colors.ORANGE_400, temp_chart, temp_georef), lambda e: show_band_config("TEMPERATURE")),
-                chart_card("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart, create_maximize_handler("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart, h2s_georef), lambda e: show_band_config("H2S")),
-                chart_card("SO2 (ppm)", ft.Colors.RED_400, so2_chart, create_maximize_handler("SO2 (ppm)", ft.Colors.RED_400, so2_chart, so2_georef), lambda e: show_band_config("SO2")),
-                chart_card("CO2 Fine (ppm)", ft.Colors.CYAN_400, co2fine_chart, create_maximize_handler("CO2 Fine (ppm)", ft.Colors.CYAN_400, co2fine_chart, co2fine_georef), lambda e: show_band_config("CO2_FINE")),
-            ], spacing=10, expand=True, scroll=ft.ScrollMode.AUTO),
-            ft.Column([
-                scatter_container,
-            ], spacing=10, expand=True),
-        ], spacing=10, expand=True),
+        dashboard_tabs,
 
         georef_panel,
     )
 
-    # --- Push point helper (needs theme-aware label colors) ---
-    def push_point(series, chart, pts, georef, xi, val, sensor_name=None):
+    sensor_states = {
+        "CO2": {"charts": [co2_chart, co2_individual_chart], "pts": co2_pts, "georef": co2_georef, "x_key": "CO2", "color": ft.Colors.PURPLE_400},
+        "CO2_FINE": {"charts": [co2_chart, co2fine_chart], "pts": co2fine_pts, "georef": co2fine_georef, "x_key": "CO2_FINE", "color": ft.Colors.CYAN_400},
+        "HUMIDITY": {"charts": [climate_chart, hum_chart], "pts": hum_pts, "georef": hum_georef, "x_key": "HUM", "color": ft.Colors.GREEN_400},
+        "TEMPERATURE": {"charts": [climate_chart, temp_chart], "pts": temp_pts, "georef": temp_georef, "x_key": "TEMP", "color": ft.Colors.ORANGE_400},
+        "H2S": {"charts": [gas_chart, h2s_chart], "pts": h2s_pts, "georef": h2s_georef, "x_key": "H2S", "color": ft.Colors.YELLOW_400},
+        "SO2": {"charts": [gas_chart, so2_chart], "pts": so2_pts, "georef": so2_georef, "x_key": "SO2", "color": ft.Colors.RED_400},
+    }
+    chart_sensor_names = {
+        id(co2_chart): ["CO2", "CO2_FINE"],
+        id(climate_chart): ["HUMIDITY", "TEMPERATURE"],
+        id(gas_chart): ["H2S", "SO2"],
+        id(co2_individual_chart): ["CO2"],
+        id(co2fine_chart): ["CO2_FINE"],
+        id(hum_chart): ["HUMIDITY"],
+        id(temp_chart): ["TEMPERATURE"],
+        id(h2s_chart): ["H2S"],
+        id(so2_chart): ["SO2"],
+        id(detail_chart): [detail_selection[0]],
+    }
+
+    def _rebuild_chart_series(chart):
+        sensor_names = chart_sensor_names[id(chart)]
+        all_points = [point for name in sensor_names for point in sensor_states[name]["pts"]]
+        if not all_points:
+            chart.data_series = [
+                fch.LineChartData(
+                    color=sensor_states[name]["color"], stroke_width=2, curved=True,
+                    rounded_stroke_cap=True, points=[],
+                )
+                for name in sensor_names
+            ]
+            chart.min_x = 0
+            chart.max_x = MAX_POINTS
+            chart.min_y = -1
+            chart.max_y = 1
+            return
+        ys = [p.y for p in all_points]
+        y_min, y_max = min(ys), max(ys)
+        margin = max((y_max - y_min) * 0.40, 3.0)
+        lo  = y_min - margin
+        hi  = y_max + margin
+        mid = (lo + hi) / 2
+
+        rebuilt_series = []
+        for name in sensor_names:
+            series_state = sensor_states[name]
+            series_color = series_state["color"]
+            series_points = series_state["pts"]
+            if config.get("use_bands", {}).get(name, False) and series_points:
+                latest = series_points[-1].y
+                bands = config.get("bands", {}).get(name, [])
+                band_color = next((b["color"] for b in bands if latest <= b["max"]), "white")
+                series_color = COLOR_MAP.get(band_color, series_color)
+            rebuilt_series.append(fch.LineChartData(
+                color=series_color, stroke_width=2, curved=True,
+                rounded_stroke_cap=True, points=list(series_points),
+            ))
+        chart.data_series = rebuilt_series
+        max_x = max((p.x for p in all_points), default=MAX_POINTS)
+        chart.min_x = max(0, max_x - MAX_POINTS)
+        chart.max_x = max(MAX_POINTS, max_x)
+        chart.min_y = lo
+        chart.max_y = hi
+        lbl_color = theme["label_color"]
+        chart.left_axis.labels = [
+            fch.ChartAxisLabel(value=lo,  label=ft.Text(f"{lo:.1f}",  size=9, color=lbl_color)),
+            fch.ChartAxisLabel(value=mid, label=ft.Text(f"{mid:.1f}", size=9, color=lbl_color)),
+            fch.ChartAxisLabel(value=hi,  label=ft.Text(f"{hi:.1f}",  size=9, color=lbl_color)),
+        ]
+        chart.horizontal_grid_lines.interval = max((hi - lo) / 4, 0.1)
+
+    def refresh_secondary_chart(chart):
+        """Keep the alternate view current when displayed."""
+        _rebuild_chart_series(chart)
+
+    # --- Push point helper: reconstruye series y marca gráfico sucio para render loop ---
+    def push_point(sensor_name, val):
+        state = sensor_states[sensor_name]
+        pts = state["pts"]
+        georef = state["georef"]
+        xi = x_idx[state["x_key"]]
         georef.append({
             "val": val,
             "lat": gps_state["lat"],
@@ -1657,74 +1936,48 @@ async def main(page: ft.Page):
         if len(pts) > MAX_POINTS:
             pts.pop(0)
 
-        ys = [p.y for p in pts]
-        y_min, y_max = min(ys), max(ys)
-        margin = max((y_max - y_min) * 0.40, 3.0)
-        lo  = y_min - margin
-        hi  = y_max + margin
-        mid = (lo + hi) / 2
+        grid_chart = state["charts"][1]
+        _rebuild_chart_series(grid_chart)
+        dirty_charts.add(grid_chart)
 
-        new_series_color = series.color
-        if sensor_name:
-            use_bands_sensor = config.get("use_bands", {}).get(sensor_name, False)
-            if use_bands_sensor:
-                sensor_bands = config.get("bands", {}).get(sensor_name, [])
-                band_color = next((b["color"] for b in sensor_bands if val <= b["max"]), "white")
-                new_series_color = COLOR_MAP.get(band_color, series.color)
-
-        new_series = fch.LineChartData(
-            color=new_series_color,
-            stroke_width=2,
-            curved=True,
-            rounded_stroke_cap=True,
-            points=list(pts),
-        )
-        chart.data_series = [new_series]
-        chart.min_x = max(0, xi - MAX_POINTS)
-        chart.max_x = max(MAX_POINTS, xi)
-        chart.min_y = lo
-        chart.max_y = hi
-        lbl_color = theme["label_color"]
-        chart.left_axis.labels = [
-            fch.ChartAxisLabel(value=lo,  label=ft.Text(f"{lo:.1f}",  size=9, color=lbl_color)),
-            fch.ChartAxisLabel(value=mid, label=ft.Text(f"{mid:.1f}", size=9, color=lbl_color)),
-            fch.ChartAxisLabel(value=hi,  label=ft.Text(f"{hi:.1f}",  size=9, color=lbl_color)),
-        ]
-        chart.horizontal_grid_lines.interval = max((hi - lo) / 4, 0.1)
+        if detail_selection[0] == sensor_name:
+            _rebuild_chart_series(detail_chart)
+            dirty_charts.add(detail_chart)
 
         # Refresh maximized dialog for this chart if open
-        dlg = line_chart_dlgs.get(chart)
-        if dlg:
+        active_chart = detail_chart if dashboard_tab_index[0] == 1 and detail_selection[0] == sensor_name else grid_chart
+        dlg = line_chart_dlgs.get(active_chart) or line_chart_dlgs.get(grid_chart)
+        if dlg and getattr(dlg, "open", False):
             try:
-                live_series = chart.data_series[0] if chart.data_series else None
-                pts_copy = list(live_series.points) if live_series else []
+                live_series = list(active_chart.data_series or [])
                 dlg_chart = fch.LineChart(
                     data_series=[
                         fch.LineChartData(
-                            color=live_series.color if live_series else series.color,
+                            color=source.color,
                             stroke_width=3,
                             curved=True,
                             rounded_stroke_cap=True,
-                            points=pts_copy,
+                            points=list(source.points),
                         )
+                        for source in live_series
                     ],
                     expand=True,
-                    min_x=chart.min_x,
-                    max_x=chart.max_x,
-                    min_y=chart.min_y,
-                    max_y=chart.max_y,
-                    animation=50,
-                    on_event=chart.on_event,
+                    min_x=active_chart.min_x,
+                    max_x=active_chart.max_x,
+                    min_y=active_chart.min_y,
+                    max_y=active_chart.max_y,
+                    animation=0,
+                    on_event=active_chart.on_event,
                     horizontal_grid_lines=fch.ChartGridLines(
-                        interval=chart.horizontal_grid_lines.interval,
+                        interval=active_chart.horizontal_grid_lines.interval,
                         color=theme["grid_color"], width=1,
                     ),
                     vertical_grid_lines=fch.ChartGridLines(
-                        interval=chart.vertical_grid_lines.interval,
+                        interval=active_chart.vertical_grid_lines.interval,
                         color=theme["grid_color"], width=1,
                     ),
-                    left_axis=fch.ChartAxis(show_labels=True, label_size=36, labels=chart.left_axis.labels),
-                    bottom_axis=fch.ChartAxis(show_labels=True, label_size=16, labels=chart.bottom_axis.labels),
+                    left_axis=fch.ChartAxis(show_labels=True, label_size=36, labels=active_chart.left_axis.labels),
+                    bottom_axis=fch.ChartAxis(show_labels=True, label_size=16, labels=active_chart.bottom_axis.labels),
                     border=ft.Border.all(1, theme["axis_color"]),
                 )
                 dlg.content.content = ft.Column([dlg_chart], expand=True)
@@ -1732,13 +1985,62 @@ async def main(page: ft.Page):
             except Exception:
                 pass
 
-        # ensure grid/axis colors are current
-        apply_chart_themes()
+    # --- Decoupled UI 30 FPS Render Loop ---
+    async def ui_render_loop():
+        while True:
+            try:
+                await asyncio.sleep(0.033)
+                if dirty_charts:
+                    active_charts = (
+                        [co2_individual_chart, co2fine_chart, hum_chart, temp_chart, h2s_chart, so2_chart]
+                        if dashboard_tab_index[0] == 0 else [detail_chart]
+                    )
+                    to_update = [c for c in active_charts if c in dirty_charts]
+                    dirty_charts.clear()
+                    for c in to_update:
+                        try:
+                            c.update()
+                        except Exception:
+                            pass
+
+                if dirty_gps[0]:
+                    dirty_gps[0] = False
+                    try:
+                        gps_badge.update()
+                        pos_badge.update()
+                    except Exception:
+                        pass
+
+                if dirty_rate[0]:
+                    dirty_rate[0] = False
+                    try:
+                        sample_rate_val.update()
+                    except Exception:
+                        pass
+
+                if dirty_conn[0]:
+                    dirty_conn[0] = False
+                    try:
+                        conn_dot.update()
+                    except Exception:
+                        pass
+
+                if dirty_table[0]:
+                    dirty_table[0] = False
+                    refresh_table_view()
+                    try:
+                        table_view.update()
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     # --- Render page first, then start MAVLink in background ---
     async def mavlink_task():
-        log_view.controls.append(ft.Text("Connecting to MAVLink...", size=10, color=theme["text_secondary"]))
-        schedule_ui_refresh()
+        add_log_message("Connecting to MAVLink...")
+        asyncio.create_task(ui_render_loop())
 
         RECONNECT_SILENCE = 30.0   # seconds before full socket rebind
         INITIAL_BACKOFF = 2.0      # first reconnect pause
@@ -1754,14 +2056,9 @@ async def main(page: ft.Page):
                 master = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: mavutil.mavlink_connection(addr)
                 )
-                log_view.controls.append(
-                    ft.Text(f"MAVLink: listening on {addr}, waiting for data... (backoff={backoff:.0f}s)", size=10,
-                            color=theme["text_secondary"])
-                )
-                schedule_ui_refresh()
+                add_log_message(f"MAVLink: listening on {addr}, waiting for data... (backoff={backoff:.0f}s)")
             except Exception as e:
-                log_view.controls.append(ft.Text(f"UDP Error: {e}", size=10, color=theme["text_secondary"]))
-                schedule_ui_refresh()
+                add_log_message(f"UDP Error: {e}")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, MAX_BACKOFF)
                 continue
@@ -1769,7 +2066,6 @@ async def main(page: ft.Page):
             last_msg_time = asyncio.get_event_loop().time()
             connection_lost_logged = False
             ever_received = False
-            rate_last_reset = time.time()
 
             def _update_conn_dot_inner(state: int):
                 if state == 1:
@@ -1781,7 +2077,7 @@ async def main(page: ft.Page):
                 else:
                     conn_dot.bgcolor = ft.Colors.YELLOW
                     conn_dot.tooltip = "Waiting for MAVLink..."
-                conn_dot.update()
+                dirty_conn[0] = True
 
             def _update_sample_rate():
                 now = time.time()
@@ -1789,7 +2085,7 @@ async def main(page: ft.Page):
                 if dt >= 1.0:
                     hz = (_rate_counts["CO2"] + _rate_counts["HUMIDITY"] + _rate_counts["TEMP"] + _rate_counts["H2S"] + _rate_counts["SO2"] + _rate_counts["CO2_FINE"]) / dt
                     sample_rate_val.value = f"{hz:.1f} Hz"
-                    sample_rate_val.update()
+                    dirty_rate[0] = True
                     _rate_counts["_last_reset"] = now
                     _rate_counts["CO2"] = 0
                     _rate_counts["HUMIDITY"] = 0
@@ -1801,16 +2097,18 @@ async def main(page: ft.Page):
             _update_conn_dot_inner(0)
 
             while True:
-                msg = master.recv_match(blocking=False)
-                if msg:
+                msg_count = 0
+                while True:
+                    msg = master.recv_match(blocking=False)
+                    if not msg:
+                        break
+                    msg_count += 1
                     last_msg_time = asyncio.get_event_loop().time()
                     connection_lost_logged = False
                     if not ever_received:
                         ever_received = True
-                        log_view.controls.append(ft.Text("MAVLink stream active ✓", size=10, color=theme["text_green"]))
+                        add_log_message("MAVLink stream active ✓", theme["text_green"])
                         _update_conn_dot_inner(1)
-                        schedule_ui_refresh()
-                        # Reset backoff on healthy traffic
                         backoff = INITIAL_BACKOFF
                     m_type = msg.get_type()
 
@@ -1820,6 +2118,7 @@ async def main(page: ft.Page):
                         gps_state["eph_cm"] = msg.eph
                         gps_badge.content.value = format_gps_badge(msg.fix_type, msg.satellites_visible, msg.eph)
                         gps_badge.bgcolor = get_gps_quality_color(msg.fix_type, msg.satellites_visible, msg.eph, theme)
+                        dirty_gps[0] = True
                     elif m_type == "GLOBAL_POSITION_INT":
                         gps_state["lat"] = msg.lat / 1e7
                         gps_state["lon"] = msg.lon / 1e7
@@ -1829,19 +2128,22 @@ async def main(page: ft.Page):
                             f"{gps_state['lon']:.4f}\u00b0  "
                             f"\u2191{gps_state['alt']:.1f}m"
                         )
+                        dirty_gps[0] = True
 
                     elif m_type == "NAMED_VALUE_FLOAT":
                         name = msg.name.strip('\x00').strip().upper()
                         val  = msg.value
                         telemetry_history.append({
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "name": name, "value": val,
                             "lat": gps_state["lat"],
                             "lon": gps_state["lon"],
                             "alt": gps_state["alt"],
                         })
+                        dirty_table[0] = True
 
                         if name == "CO2":
-                            push_point(co2_series, co2_chart, co2_pts, co2_georef, x_idx["CO2"], val, "CO2")
+                            push_point("CO2", val)
                             x_idx["CO2"] += 1
                             gps_co2_data.append((gps_state["lat"], gps_state["lon"], val, gps_state["alt"]))
                             if len(gps_co2_data) > MAX_POINTS:
@@ -1852,62 +2154,53 @@ async def main(page: ft.Page):
                                 if _scatter_render_task[0] is None or _scatter_render_task[0].done():
                                     _scatter_render_task[0] = asyncio.create_task(_update_scatter_plot_async())
                         elif name == "HUMIDITY":
-                            push_point(hum_series, hum_chart, hum_pts, hum_georef, x_idx["HUM"], val, "HUMIDITY")
+                            push_point("HUMIDITY", val)
                             x_idx["HUM"] += 1
                         elif name == "TEMP":
-                            push_point(temp_series, temp_chart, temp_pts, temp_georef, x_idx["TEMP"], val, "TEMPERATURE")
+                            push_point("TEMPERATURE", val)
                             x_idx["TEMP"] += 1
                         elif name == "H2S":
-                            push_point(h2s_series, h2s_chart, h2s_pts, h2s_georef, x_idx["H2S"], val, "H2S")
+                            push_point("H2S", val)
                             x_idx["H2S"] += 1
                         elif name == "SO2":
-                            push_point(so2_series, so2_chart, so2_pts, so2_georef, x_idx["SO2"], val, "SO2")
+                            push_point("SO2", val)
                             x_idx["SO2"] += 1
                         elif name == "CO2_FINE":
-                            push_point(co2fine_series, co2fine_chart, co2fine_pts, co2fine_georef, x_idx["CO2_FINE"], val, "CO2_FINE")
+                            push_point("CO2_FINE", val)
                             x_idx["CO2_FINE"] += 1
 
                         _rate_counts[name] = _rate_counts.get(name, 0) + 1
                         _update_sample_rate()
 
-                        log_view.controls.append(
-                            ft.Text(
-                                f"{name}: {val:.4f}  |  "
-                                f"{gps_state['lat']:.4f}° {gps_state['lon']:.4f}°  "
-                                f"↑{gps_state['alt']:.1f}m",
-                                size=10, color=theme["text_secondary"],
-                            )
+                        add_log_message(
+                            f"{name}: {val:.4f}  |  "
+                            f"{gps_state['lat']:.4f}° {gps_state['lon']:.4f}°  "
+                            f"↑{gps_state['alt']:.1f}m"
                         )
-                        if len(log_view.controls) > 100:
-                            log_view.controls.pop(0)
 
-                    schedule_ui_refresh()
+                    if msg_count >= 50:
+                        break
 
-                await asyncio.sleep(0.01)
+                if msg_count == 0:
+                    await asyncio.sleep(0.005)
+                else:
+                    await asyncio.sleep(0.001)
+
                 now = asyncio.get_event_loop().time()
                 elapsed = now - last_msg_time
                 if elapsed > 10 and not connection_lost_logged:
                     if ever_received:
-                        log_view.controls.append(
-                            ft.Text("MAVLink: connection lost, waiting...", size=10, color=theme["text_secondary"])
-                        )
+                        add_log_message("MAVLink: connection lost, waiting...")
                         _update_conn_dot_inner(-1)
                     else:
-                        log_view.controls.append(
-                            ft.Text(
-                                "MAVLink: no autopilot data on 14550. "
-                                "(Mission Planner mirror only forwards when drone is linked)",
-                                size=10, color=theme["text_secondary"],
-                            )
+                        add_log_message(
+                            "MAVLink: no autopilot data on 14550. "
+                            "(Mission Planner mirror only forwards when drone is linked)"
                         )
-                    schedule_ui_refresh()
                     connection_lost_logged = True
 
                 if elapsed > RECONNECT_SILENCE:
-                    log_view.controls.append(
-                        ft.Text(f"MAVLink: reconnecting in {backoff:.0f}s...", size=10, color=theme["text_secondary"])
-                    )
-                    schedule_ui_refresh()
+                    add_log_message(f"MAVLink: reconnecting in {backoff:.0f}s...")
                     master.close()
                     await asyncio.sleep(backoff)
                     break  # break inner loop to rebind in outer loop
@@ -1915,10 +2208,7 @@ async def main(page: ft.Page):
                 # Handle settings restart request
                 if restart_event.is_set():
                     restart_event.clear()
-                    log_view.controls.append(
-                        ft.Text("MAVLink: restarting with new address...", size=10, color=theme["text_secondary"])
-                    )
-                    schedule_ui_refresh()
+                    add_log_message("MAVLink: restarting with new address...")
                     master.close()
                     break  # rebind in outer loop with new config
 

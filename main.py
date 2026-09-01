@@ -540,7 +540,7 @@ async def main(page: ft.Page):
 
     page.theme_mode = ft.ThemeMode.DARK if is_dark else ft.ThemeMode.LIGHT
     page.bgcolor = theme["page_bg"]
-    page.padding = 20
+    page.padding = ft.Padding.symmetric(horizontal=10, vertical=6)
 
     # Show a loading indicator immediately so the window doesn't stay blank
     loading = ft.ProgressRing(width=32, height=32, color=theme["text_blue"])
@@ -827,7 +827,7 @@ async def main(page: ft.Page):
         (detail_series, detail_chart),
     ])
 
-    def chart_card(label, color, chart, maximize_action=None, config_action=None, compact_height=None, on_tap=None):
+    def chart_card(label, color, chart, maximize_action=None, config_action=None, on_tap=None):
         t = theme
         config_buttons = []
         if callable(config_action):
@@ -877,7 +877,6 @@ async def main(page: ft.Page):
                 title_row,
                 chart,
             ], spacing=0, expand=True),
-            height=compact_height if compact_height else 420,
             bgcolor=t["card_bg"],
             padding=ft.Padding.symmetric(horizontal=10, vertical=8),
             border_radius=10,
@@ -1032,8 +1031,7 @@ async def main(page: ft.Page):
                 ),
             ], tight=True),
             scatter_box,
-        ], spacing=5),
-        height=300,
+        ], spacing=5, expand=True),
         bgcolor=theme["card_bg"],
         padding=15,
         border_radius=10,
@@ -1663,8 +1661,6 @@ async def main(page: ft.Page):
         on_click=show_offline_download_dialog,
     )
 
-    GRID_CARD_HEIGHT = 230
-    GRID_TOTAL_HEIGHT = GRID_CARD_HEIGHT * 3 + 20
     detail_selection = ["CO2"]
     dashboard_tab_index = [0]
     detail_heading = ft.Text("CO₂ (ppm)", size=16, weight="bold", color=ft.Colors.PURPLE_400)
@@ -1699,27 +1695,27 @@ async def main(page: ft.Page):
         chart_card("CO₂ (ppm)", ft.Colors.PURPLE_400, co2_individual_chart,
                    create_maximize_handler("CO₂ (ppm)", ft.Colors.PURPLE_400, co2_individual_chart, co2_georef),
                    [("CO₂", ft.Colors.PURPLE_400, lambda e: show_band_config("CO2"))],
-                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("CO2")),
+                   on_tap=open_sensor_detail("CO2")),
         chart_card("CO₂ Fine (ppm)", ft.Colors.CYAN_400, co2fine_chart,
                    create_maximize_handler("CO₂ Fine (ppm)", ft.Colors.CYAN_400, co2fine_chart, co2fine_georef),
                    [("CO₂ Fine", ft.Colors.CYAN_400, lambda e: show_band_config("CO2_FINE"))],
-                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("CO2_FINE")),
+                   on_tap=open_sensor_detail("CO2_FINE")),
         chart_card("HUMIDITY (%)", ft.Colors.GREEN_400, hum_chart,
                    create_maximize_handler("Humidity (%)", ft.Colors.GREEN_400, hum_chart, hum_georef),
                    [("Humidity", ft.Colors.GREEN_400, lambda e: show_band_config("HUMIDITY"))],
-                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("HUMIDITY")),
+                   on_tap=open_sensor_detail("HUMIDITY")),
         chart_card("TEMPERATURE (°C)", ft.Colors.ORANGE_400, temp_chart,
                    create_maximize_handler("Temperature (°C)", ft.Colors.ORANGE_400, temp_chart, temp_georef),
                    [("Temperature", ft.Colors.ORANGE_400, lambda e: show_band_config("TEMPERATURE"))],
-                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("TEMPERATURE")),
+                   on_tap=open_sensor_detail("TEMPERATURE")),
         chart_card("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart,
                    create_maximize_handler("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart, h2s_georef),
                    [("H2S", ft.Colors.YELLOW_400, lambda e: show_band_config("H2S"))],
-                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("H2S")),
+                   on_tap=open_sensor_detail("H2S")),
         chart_card("SO₂ (ppm)", ft.Colors.RED_400, so2_chart,
                    create_maximize_handler("SO₂ (ppm)", ft.Colors.RED_400, so2_chart, so2_georef),
                    [("SO₂", ft.Colors.RED_400, lambda e: show_band_config("SO2"))],
-                   compact_height=GRID_CARD_HEIGHT, on_tap=open_sensor_detail("SO2")),
+                   on_tap=open_sensor_detail("SO2")),
     ]
 
     detail_card = chart_card(
@@ -1751,17 +1747,16 @@ async def main(page: ft.Page):
 
     refresh_table_view()
 
-    scatter_container.height = GRID_TOTAL_HEIGHT
     grid_view = ft.Column([
         ft.Row([
             ft.Column([
-                ft.Row([individual_cards[0], individual_cards[1]], spacing=10, height=GRID_CARD_HEIGHT),
-                ft.Row([individual_cards[2], individual_cards[3]], spacing=10, height=GRID_CARD_HEIGHT),
-                ft.Row([individual_cards[4], individual_cards[5]], spacing=10, height=GRID_CARD_HEIGHT),
-            ], spacing=10, expand=True),
+                ft.Row([individual_cards[0], individual_cards[1]], spacing=10, expand=1),
+                ft.Row([individual_cards[2], individual_cards[3]], spacing=10, expand=1),
+                ft.Row([individual_cards[4], individual_cards[5]], spacing=10, expand=1),
+            ], spacing=10, expand=1),
             scatter_container,
-        ], spacing=10, height=GRID_TOTAL_HEIGHT),
-    ], expand=True, scroll=ft.ScrollMode.AUTO)
+        ], spacing=10, expand=1),
+    ], expand=True)
     individual_view = ft.Column([
         detail_heading,
         ft.Text("Haz clic en cualquier gráfica de la cuadrícula para mostrarla aquí.",

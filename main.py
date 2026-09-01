@@ -697,6 +697,17 @@ async def main(page: ft.Page):
                 pass
 
     # --- Chart factory for grouped line charts ---
+    def make_chart_tooltip():
+        return fch.LineChartTooltip(
+            bgcolor="#E6111820",
+            border_radius=8,
+            padding=10,
+            max_width=180,
+            border_side=ft.BorderSide(1, theme["axis_color"]),
+            fit_inside_horizontally=True,
+            fit_inside_vertically=True,
+        )
+
     def make_chart(colors, on_event):
         t = theme
         if not isinstance(colors, (list, tuple)):
@@ -712,6 +723,7 @@ async def main(page: ft.Page):
             for color in colors
         ]
         chart = fch.LineChart(
+            tooltip=make_chart_tooltip(),
             data_series=series,
             expand=True,
             min_x=0,
@@ -902,6 +914,7 @@ async def main(page: ft.Page):
         def handler(e):
             live_series = list(chart.data_series or [])
             dlg_chart = fch.LineChart(
+                tooltip=make_chart_tooltip(),
                 data_series=[
                     fch.LineChartData(
                         color=source.color,
@@ -1102,6 +1115,10 @@ async def main(page: ft.Page):
 
     # --- Raw Data Table (persistent dashboard tab) ---
     def build_data_table():
+        def sensor_text(row, sensor_name):
+            value = row.get(sensor_name)
+            return "—" if value is None else f"{value:.3f}"
+
         columns = [
             ft.DataColumn(ft.Text("Nº", size=10, color=theme["text_primary"]), numeric=True),
             ft.DataColumn(ft.Text("Fecha / Hora", size=10, color=theme["text_primary"])),
@@ -1122,12 +1139,12 @@ async def main(page: ft.Page):
                     cells=[
                         ft.DataCell(ft.Text(str(row["sample"]), size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(row["timestamp"], size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(f"{row['CO2']:.3f}", size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(f"{row['HUMIDITY']:.3f}", size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(f"{row['TEMP']:.3f}", size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(f"{row['H2S']:.3f}", size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(f"{row['SO2']:.3f}", size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(f"{row['CO2_FINE']:.3f}", size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(sensor_text(row, "CO2"), size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(sensor_text(row, "HUMIDITY"), size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(sensor_text(row, "TEMP"), size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(sensor_text(row, "H2S"), size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(sensor_text(row, "SO2"), size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(sensor_text(row, "CO2_FINE"), size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['lat']:.5f}", size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['lon']:.5f}", size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['alt']:.1f}", size=9, color=theme["text_secondary"])),
@@ -1956,13 +1973,19 @@ async def main(page: ft.Page):
         if len(georef) > MAX_POINTS:
             georef.pop(0)
 
-        tooltip_str = (
-            f"{val:.2f} | {gps_state['lat']:.4f}° {gps_state['lon']:.4f}° | ↑{gps_state['alt']:.1f}m"
+        tooltip = fch.LineChartDataPointTooltip(
+            text=f"X: {xi}\nY: {val:.3f}\nAltitud: {gps_state['alt']:.1f} m",
+            text_style=ft.TextStyle(
+                color=ft.Colors.WHITE,
+                size=11,
+                weight=ft.FontWeight.W_600,
+            ),
+            text_align=ft.TextAlign.LEFT,
         )
         pts.append(fch.LineChartDataPoint(
             x=xi, y=val,
             show_tooltip=True,
-            tooltip=tooltip_str,
+            tooltip=tooltip,
         ))
         if len(pts) > MAX_POINTS:
             pts.pop(0)
@@ -1982,6 +2005,7 @@ async def main(page: ft.Page):
             try:
                 live_series = list(active_chart.data_series or [])
                 dlg_chart = fch.LineChart(
+                    tooltip=make_chart_tooltip(),
                     data_series=[
                         fch.LineChartData(
                             color=source.color,
@@ -2175,16 +2199,20 @@ async def main(page: ft.Page):
                         if name in table_sensor_names:
                             table_pending_values[name] = val
                             table_pending_names.add(name)
-                            if table_pending_names == set(table_sensor_names):
+                            if name == "CO2_FINE":
                                 table_sample_number[0] += 1
                                 table_history.append({
                                     "sample": table_sample_number[0],
                                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    **table_pending_values,
+                                    **{
+                                        sensor_name: table_pending_values.get(sensor_name)
+                                        for sensor_name in table_sensor_names
+                                    },
                                     "lat": gps_state["lat"],
                                     "lon": gps_state["lon"],
                                     "alt": gps_state["alt"],
                                 })
+                                table_pending_values.clear()
                                 table_pending_names.clear()
                                 dirty_table[0] = True
 

@@ -552,6 +552,11 @@ async def main(page: ft.Page):
 
     # --- Data State ---
     telemetry_history = []
+    table_history = deque(maxlen=250)
+    table_sensor_names = ("CO2", "HUMIDITY", "TEMP", "H2S", "SO2", "CO2_FINE")
+    table_pending_values = {}
+    table_pending_names = set()
+    table_sample_number = [0]
     co2_pts, hum_pts, temp_pts = [], [], []
     h2s_pts, so2_pts, co2fine_pts = [], [], []
     x_idx = {"CO2": 0, "HUM": 0, "TEMP": 0, "H2S": 0, "SO2": 0, "CO2_FINE": 0}
@@ -1098,24 +1103,31 @@ async def main(page: ft.Page):
     # --- Raw Data Table (persistent dashboard tab) ---
     def build_data_table():
         columns = [
-            ft.DataColumn(ft.Text("Timestamp", size=10, color=theme["text_primary"])),
-            ft.DataColumn(ft.Text("Hora", size=10, color=theme["text_primary"])),
-            ft.DataColumn(ft.Text("Sensor", size=10, color=theme["text_primary"])),
-            ft.DataColumn(ft.Text("Value", size=10, color=theme["text_primary"])),
+            ft.DataColumn(ft.Text("Nº", size=10, color=theme["text_primary"]), numeric=True),
+            ft.DataColumn(ft.Text("Fecha / Hora", size=10, color=theme["text_primary"])),
+            ft.DataColumn(ft.Text("CO₂ (ppm)", size=10, color=theme["text_primary"]), numeric=True),
+            ft.DataColumn(ft.Text("Humedad (%)", size=10, color=theme["text_primary"]), numeric=True),
+            ft.DataColumn(ft.Text("Temp. (°C)", size=10, color=theme["text_primary"]), numeric=True),
+            ft.DataColumn(ft.Text("H₂S (ppm)", size=10, color=theme["text_primary"]), numeric=True),
+            ft.DataColumn(ft.Text("SO₂ (ppm)", size=10, color=theme["text_primary"]), numeric=True),
+            ft.DataColumn(ft.Text("CO₂ Fine (ppm)", size=10, color=theme["text_primary"]), numeric=True),
             ft.DataColumn(ft.Text("Lat", size=10, color=theme["text_primary"])),
             ft.DataColumn(ft.Text("Lon", size=10, color=theme["text_primary"])),
             ft.DataColumn(ft.Text("Alt", size=10, color=theme["text_primary"])),
         ]
         rows = []
-        for row in telemetry_history[-250:]:
-            timestamp = row["timestamp"]
+        for row in table_history:
             rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(timestamp, size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(timestamp.split(" ")[-1], size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(row["name"], size=9, color=theme["text_secondary"])),
-                        ft.DataCell(ft.Text(f"{row['value']:.3f}", size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(str(row["sample"]), size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(row["timestamp"], size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(f"{row['CO2']:.3f}", size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(f"{row['HUMIDITY']:.3f}", size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(f"{row['TEMP']:.3f}", size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(f"{row['H2S']:.3f}", size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(f"{row['SO2']:.3f}", size=9, color=theme["text_secondary"])),
+                        ft.DataCell(ft.Text(f"{row['CO2_FINE']:.3f}", size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['lat']:.5f}", size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['lon']:.5f}", size=9, color=theme["text_secondary"])),
                         ft.DataCell(ft.Text(f"{row['alt']:.1f}", size=9, color=theme["text_secondary"])),
@@ -1725,10 +1737,18 @@ async def main(page: ft.Page):
 
     def on_dashboard_tab_change(e):
         dashboard_tab_index[0] = e.control.selected_index
-        active_charts = (
-            [co2_individual_chart, co2fine_chart, hum_chart, temp_chart, h2s_chart, so2_chart]
-            if dashboard_tab_index[0] == 0 else [detail_chart]
-        )
+        if dashboard_tab_index[0] == 0:
+            active_charts = [co2_individual_chart, co2fine_chart, hum_chart, temp_chart, h2s_chart, so2_chart]
+        elif dashboard_tab_index[0] == 1:
+            active_charts = [detail_chart]
+        else:
+            active_charts = []
+            dirty_table[0] = False
+            refresh_table_view()
+            try:
+                table_view.update()
+            except Exception:
+                schedule_ui_refresh()
         for c in active_charts:
             refresh_secondary_chart(c)
         try:
@@ -1899,6 +1919,22 @@ async def main(page: ft.Page):
             fch.ChartAxisLabel(value=mid, label=ft.Text(f"{mid:.1f}", size=9, color=lbl_color)),
             fch.ChartAxisLabel(value=hi,  label=ft.Text(f"{hi:.1f}",  size=9, color=lbl_color)),
         ]
+        x_start = int(chart.min_x)
+        x_end = int(chart.max_x)
+        chart.bottom_axis.labels = [
+            fch.ChartAxisLabel(
+                value=x,
+                label=ft.Text(str(x), size=9, color=lbl_color),
+            )
+            for x in range(x_start, x_end + 1, 10)
+        ]
+        if not chart.bottom_axis.labels or chart.bottom_axis.labels[-1].value != x_end:
+            chart.bottom_axis.labels.append(
+                fch.ChartAxisLabel(
+                    value=x_end,
+                    label=ft.Text(str(x_end), size=9, color=lbl_color),
+                )
+            )
         chart.horizontal_grid_lines.interval = max((hi - lo) / 4, 0.1)
 
     def refresh_secondary_chart(chart):
@@ -1935,7 +1971,7 @@ async def main(page: ft.Page):
         _rebuild_chart_series(grid_chart)
         dirty_charts.add(grid_chart)
 
-        if detail_selection[0] == sensor_name:
+        if dashboard_tab_index[0] == 1 and detail_selection[0] == sensor_name:
             _rebuild_chart_series(detail_chart)
             dirty_charts.add(detail_chart)
 
@@ -2020,7 +2056,7 @@ async def main(page: ft.Page):
                     except Exception:
                         pass
 
-                if dirty_table[0]:
+                if dirty_table[0] and dashboard_tab_index[0] == 2:
                     dirty_table[0] = False
                     refresh_table_view()
                     try:
@@ -2135,7 +2171,22 @@ async def main(page: ft.Page):
                             "lon": gps_state["lon"],
                             "alt": gps_state["alt"],
                         })
-                        dirty_table[0] = True
+
+                        if name in table_sensor_names:
+                            table_pending_values[name] = val
+                            table_pending_names.add(name)
+                            if table_pending_names == set(table_sensor_names):
+                                table_sample_number[0] += 1
+                                table_history.append({
+                                    "sample": table_sample_number[0],
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    **table_pending_values,
+                                    "lat": gps_state["lat"],
+                                    "lon": gps_state["lon"],
+                                    "alt": gps_state["alt"],
+                                })
+                                table_pending_names.clear()
+                                dirty_table[0] = True
 
                         if name == "CO2":
                             push_point("CO2", val)

@@ -22,10 +22,12 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 MAX_POINTS = 50
+MIN_CHART_WINDOW = 10
+MAX_CHART_WINDOW = 10000
 THEME_FILE = Path(__file__).with_name("theme.json")
 CONFIG_FILE = Path(__file__).with_name("config.json")
 AUTOSAVE_FILE = Path(__file__).with_name("telemetry_latest.csv")
-AUTOSAVE_INTERVAL = 5.0  # seconds between auto-saves
+AUTOSAVE_INTERVAL = 30.0  # seconds between auto-saves
 
 DEFAULT_CONFIG = {
     "mavlink_bind_host": "0.0.0.0",
@@ -86,6 +88,9 @@ COLOR_MAP = {
     "white": "#ffffff",
     "black": "#000000",
 }
+
+# Blue keeps the H2S trace and labels legible on both light and dark cards.
+H2S_COLOR = ft.Colors.BLUE_600
 
 
 def load_config():
@@ -507,6 +512,18 @@ def _render_3d_scatter(data_list, width_px, height_px, theme_ref, is_dark_ref):
 
 async def main(page: ft.Page):
     page.title = "MiniHawk Dashboard"
+
+    # Resolve a writable, platform-appropriate location for packaged builds.
+    storage_paths = ft.StoragePaths()
+    try:
+        documents_dir = Path(
+            await storage_paths.get_application_documents_directory()
+        )
+        documents_dir.mkdir(parents=True, exist_ok=True)
+        autosave_file = documents_dir / AUTOSAVE_FILE.name
+    except Exception:
+        # Source runs and platforms without StoragePaths support use the app folder.
+        autosave_file = AUTOSAVE_FILE
     
     current_theme = load_theme()  # "dark" or "light"
     is_dark = current_theme == "dark"
@@ -583,6 +600,7 @@ async def main(page: ft.Page):
     pos_badge_ref = [None]
     theme_btn_ref = [None]
     charts_refs = []           # (series, chart, label_color_key)
+    chart_view_states = {}     # chart id -> visible window and navigation position
     scatter_dlg_ref = [None]   # maximized scatter dialog
     line_chart_dlgs = {}       # chart -> maximized dialog ref
 
@@ -727,7 +745,7 @@ async def main(page: ft.Page):
             data_series=series,
             expand=True,
             min_x=0,
-            max_x=MAX_POINTS,
+            max_x=MAX_POINTS - 1,
             min_y=-1,
             max_y=1,
             animation=0,
@@ -739,21 +757,22 @@ async def main(page: ft.Page):
                 interval=10, color=t["grid_color"], width=1,
             ),
             left_axis=fch.ChartAxis(
-                show_labels=True, label_size=36, labels=[],
+                show_labels=True, label_size=44, labels=[],
             ),
             bottom_axis=fch.ChartAxis(
-                show_labels=True, label_size=16,
+                show_labels=True, label_size=22,
                 labels=[
-                    fch.ChartAxisLabel(value=0,          label=ft.Text("0",  size=9, color=t["label_color"])),
-                    fch.ChartAxisLabel(value=10,         label=ft.Text("10", size=9, color=t["label_color"])),
-                    fch.ChartAxisLabel(value=20,         label=ft.Text("20", size=9, color=t["label_color"])),
-                    fch.ChartAxisLabel(value=30,         label=ft.Text("30", size=9, color=t["label_color"])),
-                    fch.ChartAxisLabel(value=40,         label=ft.Text("40", size=9, color=t["label_color"])),
-                    fch.ChartAxisLabel(value=MAX_POINTS, label=ft.Text("50", size=9, color=t["label_color"])),
+                    fch.ChartAxisLabel(value=0,          label=ft.Text("0",  size=11, color=t["label_color"])),
+                    fch.ChartAxisLabel(value=10,         label=ft.Text("10", size=11, color=t["label_color"])),
+                    fch.ChartAxisLabel(value=20,         label=ft.Text("20", size=11, color=t["label_color"])),
+                    fch.ChartAxisLabel(value=30,         label=ft.Text("30", size=11, color=t["label_color"])),
+                    fch.ChartAxisLabel(value=40,         label=ft.Text("40", size=11, color=t["label_color"])),
+                    fch.ChartAxisLabel(value=MAX_POINTS - 1, label=ft.Text("49", size=11, color=t["label_color"])),
                 ],
             ),
             border=ft.Border.all(1, t["axis_color"]),
         )
+        chart_view_states[id(chart)] = {"window": MAX_POINTS, "end_x": None}
         return series, chart
 
     # --- Hover handlers ---
@@ -763,7 +782,8 @@ async def main(page: ft.Page):
                 if not e.spots:
                     return
                 spot = e.spots[0]
-                idx = spot.spot_index if hasattr(spot, "spot_index") else spot[1]
+                visible_index = spot.spot_index if hasattr(spot, "spot_index") else spot[1]
+                idx = int(e.control.min_x or 0) + visible_index
                 if 0 <= idx < len(georef_list):
                     d = georef_list[idx]
                     georef_val.value   = f"{d['val']:.4f}"
@@ -783,7 +803,8 @@ async def main(page: ft.Page):
                 if not e.spots:
                     return
                 spot = e.spots[0]
-                point_index = spot.spot_index if hasattr(spot, "spot_index") else spot[1]
+                visible_index = spot.spot_index if hasattr(spot, "spot_index") else spot[1]
+                point_index = int(e.control.min_x or 0) + visible_index
                 series_index = next(
                     (getattr(spot, attr) for attr in ("series_index", "bar_index", "data_set_index")
                      if hasattr(spot, attr)),
@@ -817,14 +838,14 @@ async def main(page: ft.Page):
         [ft.Colors.GREEN_400, ft.Colors.ORANGE_400], make_group_on_event([hum_georef, temp_georef])
     )
     gas_series, gas_chart = make_chart(
-        [ft.Colors.YELLOW_400, ft.Colors.RED_400], make_group_on_event([h2s_georef, so2_georef])
+        [H2S_COLOR, ft.Colors.RED_400], make_group_on_event([h2s_georef, so2_georef])
     )
     co2_series, co2_chart = make_chart(
         [ft.Colors.PURPLE_400, ft.Colors.CYAN_400], make_group_on_event([co2_georef, co2fine_georef])
     )
     hum_series, hum_chart = make_chart(ft.Colors.GREEN_400, make_on_event(hum_georef))
     temp_series, temp_chart = make_chart(ft.Colors.ORANGE_400, make_on_event(temp_georef))
-    h2s_series, h2s_chart = make_chart(ft.Colors.YELLOW_400, make_on_event(h2s_georef))
+    h2s_series, h2s_chart = make_chart(H2S_COLOR, make_on_event(h2s_georef))
     so2_series, so2_chart = make_chart(ft.Colors.RED_400, make_on_event(so2_georef))
     co2fine_series, co2fine_chart = make_chart(ft.Colors.CYAN_400, make_on_event(co2fine_georef))
     # Dedicated CO2 panel used in the individual view.
@@ -844,8 +865,102 @@ async def main(page: ft.Page):
         (detail_series, detail_chart),
     ])
 
-    def chart_card(label, color, chart, maximize_action=None, config_action=None, on_tap=None):
+    def apply_global_chart_window(window):
+        """Apply one sample-window size to every line chart."""
+        window = max(MIN_CHART_WINDOW, min(MAX_CHART_WINDOW, int(window)))
+        for state in chart_view_states.values():
+            state["window"] = window
+            state["end_x"] = None
+        for _, target_chart in charts_refs:
+            _rebuild_chart_series(target_chart)
+            try:
+                target_chart.update()
+            except Exception:
+                pass
+
+    def set_global_chart_window(e):
+        try:
+            window = int(e.control.value)
+        except (TypeError, ValueError):
+            window = MAX_POINTS
+        window = max(MIN_CHART_WINDOW, min(MAX_CHART_WINDOW, window))
+        global_window_field.value = str(window)
+        apply_global_chart_window(window)
+        schedule_ui_refresh()
+
+    def nudge_global_chart_window(delta):
+        def handler(e):
+            try:
+                current = int(global_window_field.value)
+            except (TypeError, ValueError):
+                current = MAX_POINTS
+            new_window = max(
+                MIN_CHART_WINDOW,
+                min(MAX_CHART_WINDOW, current + delta),
+            )
+            global_window_field.value = str(new_window)
+            apply_global_chart_window(new_window)
+            schedule_ui_refresh()
+        return handler
+
+    global_window_field = ft.TextField(
+        value=str(MAX_POINTS),
+        width=78,
+        height=40,
+        text_size=15,
+        text_style=ft.TextStyle(weight=ft.FontWeight.W_600),
+        offset=ft.Offset(0, 0.18),
+        dense=True,
+        text_align=ft.TextAlign.CENTER,
+        keyboard_type=ft.KeyboardType.NUMBER,
+        content_padding=ft.Padding.symmetric(horizontal=7, vertical=2),
+        tooltip=f"Muestras visibles ({MIN_CHART_WINDOW}–{MAX_CHART_WINDOW})",
+        on_submit=set_global_chart_window,
+        on_blur=set_global_chart_window,
+    )
+
+    def chart_card(
+        label, color, chart, maximize_action=None, config_action=None,
+        on_tap=None, navigation_controls=False,
+    ):
         t = theme
+
+        def refresh_chart_view():
+            _rebuild_chart_series(chart)
+            try:
+                chart.update()
+            except Exception:
+                schedule_ui_refresh()
+
+        def shift_view(direction):
+            def handler(e):
+                state = chart_view_states[id(chart)]
+                latest = _latest_x_for_chart(chart)
+                window = state["window"]
+                current_end = latest if state["end_x"] is None else state["end_x"]
+                step = max(1, window // 2)
+                state["end_x"] = max(window - 1, min(latest, current_end + direction * step))
+                if state["end_x"] >= latest:
+                    state["end_x"] = None
+                refresh_chart_view()
+            return handler
+
+        def zoom_view(direction):
+            def handler(e):
+                state = chart_view_states[id(chart)]
+                new_window = max(
+                    MIN_CHART_WINDOW,
+                    min(MAX_CHART_WINDOW, state["window"] + direction * 10),
+                )
+                global_window_field.value = str(new_window)
+                apply_global_chart_window(new_window)
+                schedule_ui_refresh()
+            return handler
+
+        def return_live(e):
+            chart_view_states[id(chart)]["end_x"] = None
+            refresh_chart_view()
+
         config_buttons = []
         if callable(config_action):
             config_buttons.append(ft.IconButton(
@@ -868,9 +983,17 @@ async def main(page: ft.Page):
                 ))
 
         title_controls = [
-            ft.Text(label, size=11, weight="bold", color=color, expand=True),
+            ft.Text(label, size=13, weight="bold", color=color, expand=True),
             *config_buttons,
         ]
+        if navigation_controls:
+            title_controls.extend([
+                ft.IconButton(icon=ft.Icons.ZOOM_IN, icon_size=14, tooltip="Acercar", on_click=zoom_view(-1), padding=2),
+                ft.IconButton(icon=ft.Icons.ZOOM_OUT, icon_size=14, tooltip="Alejar", on_click=zoom_view(1), padding=2),
+                ft.IconButton(icon=ft.Icons.CHEVRON_LEFT, icon_size=16, tooltip="Ver muestras anteriores", on_click=shift_view(-1), padding=2),
+                ft.IconButton(icon=ft.Icons.CHEVRON_RIGHT, icon_size=16, tooltip="Ver muestras siguientes", on_click=shift_view(1), padding=2),
+                ft.IconButton(icon=ft.Icons.LIVE_TV, icon_size=14, tooltip="Volver a datos en vivo", on_click=return_live, padding=2),
+            ])
         if on_tap:
             title_controls.append(ft.IconButton(
                 icon=ft.Icons.OPEN_IN_NEW,
@@ -940,8 +1063,8 @@ async def main(page: ft.Page):
                     interval=chart.vertical_grid_lines.interval,
                     color=theme["grid_color"], width=1,
                 ),
-                left_axis=fch.ChartAxis(show_labels=True, label_size=36, labels=chart.left_axis.labels),
-                bottom_axis=fch.ChartAxis(show_labels=True, label_size=16, labels=chart.bottom_axis.labels),
+                left_axis=fch.ChartAxis(show_labels=True, label_size=44, labels=chart.left_axis.labels),
+                bottom_axis=fch.ChartAxis(show_labels=True, label_size=22, labels=chart.bottom_axis.labels),
                 border=ft.Border.all(1, theme["axis_color"]),
             )
             dlg = ft.AlertDialog(
@@ -1287,15 +1410,40 @@ async def main(page: ft.Page):
     # Instantiate FilePicker but do NOT add to overlay (avoids "Unknown control" error)
     file_picker = ft.FilePicker()
 
-    async def download_csv(e):
+    def build_csv_bytes(rows):
         import io
 
-        # Build CSV in memory
         output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["name", "value", "lat", "lon", "alt"])
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["timestamp", "name", "value", "lat", "lon", "alt"],
+        )
         writer.writeheader()
-        writer.writerows(telemetry_history)
-        csv_bytes = output.getvalue().encode("utf-8")
+        writer.writerows(rows)
+        return output.getvalue().encode("utf-8")
+
+    def write_autosave(rows):
+        """Atomically replace the latest automatic telemetry snapshot."""
+        temp_file = autosave_file.with_suffix(".tmp")
+        temp_file.write_bytes(build_csv_bytes(rows))
+        os.replace(temp_file, autosave_file)
+
+    async def autosave_loop():
+        while True:
+            await asyncio.sleep(AUTOSAVE_INTERVAL)
+            if not telemetry_history:
+                continue
+            try:
+                snapshot = list(telemetry_history)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, write_autosave, snapshot)
+            except asyncio.CancelledError:
+                break
+            except Exception as ex:
+                add_log_message(f"CSV autosave error: {ex}", ft.Colors.RED_400)
+
+    async def download_csv(e):
+        csv_bytes = build_csv_bytes(list(telemetry_history))
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"sensors_export_{timestamp}.csv"
@@ -1365,6 +1513,9 @@ async def main(page: ft.Page):
                     page.snack_bar.open = True
                     schedule_ui_refresh()
 
+    # Keep a reference so its explicit color follows theme changes.
+    minihawk_title = ft.Text("MiniHawk", size=24, weight="bold", color=theme["text_primary"])
+
     # --- Theme Toggle ---
     def toggle_theme(e):
         nonlocal is_dark, theme
@@ -1383,6 +1534,7 @@ async def main(page: ft.Page):
         georef_panel.border = ft.Border.all(1, theme["georef_border"])
         georef_val.color = theme["text_primary"]
         pos_badge.bgcolor = theme["card_bg"]
+        minihawk_title.color = theme["text_primary"]
 
         # Update chart styles
         apply_chart_themes()
@@ -1699,7 +1851,7 @@ async def main(page: ft.Page):
         "CO2_FINE": ("CO₂ Fine (ppm)", ft.Colors.CYAN_400, co2fine_georef),
         "HUMIDITY": ("HUMIDITY (%)", ft.Colors.GREEN_400, hum_georef),
         "TEMPERATURE": ("TEMPERATURE (°C)", ft.Colors.ORANGE_400, temp_georef),
-        "H2S": ("H2S (ppm)", ft.Colors.YELLOW_400, h2s_georef),
+        "H2S": ("H2S (ppm)", H2S_COLOR, h2s_georef),
         "SO2": ("SO₂ (ppm)", ft.Colors.RED_400, so2_georef),
     }
 
@@ -1737,9 +1889,9 @@ async def main(page: ft.Page):
                    create_maximize_handler("Temperature (°C)", ft.Colors.ORANGE_400, temp_chart, temp_georef),
                    [("Temperature", ft.Colors.ORANGE_400, lambda e: show_band_config("TEMPERATURE"))],
                    on_tap=open_sensor_detail("TEMPERATURE")),
-        chart_card("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart,
-                   create_maximize_handler("H2S (ppm)", ft.Colors.YELLOW_400, h2s_chart, h2s_georef),
-                   [("H2S", ft.Colors.YELLOW_400, lambda e: show_band_config("H2S"))],
+        chart_card("H2S (ppm)", H2S_COLOR, h2s_chart,
+                   create_maximize_handler("H2S (ppm)", H2S_COLOR, h2s_chart, h2s_georef),
+                   [("H2S", H2S_COLOR, lambda e: show_band_config("H2S"))],
                    on_tap=open_sensor_detail("H2S")),
         chart_card("SO₂ (ppm)", ft.Colors.RED_400, so2_chart,
                    create_maximize_handler("SO₂ (ppm)", ft.Colors.RED_400, so2_chart, so2_georef),
@@ -1750,6 +1902,7 @@ async def main(page: ft.Page):
     detail_card = chart_card(
         "Vista ampliada", ft.Colors.PURPLE_400, detail_chart,
         create_maximize_handler("Vista ampliada", ft.Colors.PURPLE_400, detail_chart, co2_georef),
+        navigation_controls=True,
     )
 
     def on_dashboard_tab_change(e):
@@ -1827,7 +1980,7 @@ async def main(page: ft.Page):
     page.add(
         ft.Row([
             ft.Column([
-                ft.Text("MiniHawk", size=24, weight="bold", color=theme["text_primary"]),
+                minihawk_title,
                 ft.Row([
                     ft.Column([
                         ft.Text("GPS QUALITY", size=9, color=theme["label_color"]),
@@ -1846,6 +1999,18 @@ async def main(page: ft.Page):
                         sample_rate_val,
                     ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ], spacing=0, alignment=ft.MainAxisAlignment.CENTER),
+                ft.Row([
+                    ft.Text("Ventana", size=10, color=theme["label_color"]),
+                    ft.IconButton(
+                        icon=ft.Icons.REMOVE, icon_size=14, tooltip="Restar 10 muestras",
+                        on_click=nudge_global_chart_window(-10), padding=2,
+                    ),
+                    global_window_field,
+                    ft.IconButton(
+                        icon=ft.Icons.ADD, icon_size=14, tooltip="Sumar 10 muestras",
+                        on_click=nudge_global_chart_window(10), padding=2,
+                    ),
+                ], spacing=1, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.FilledButton("Export CSV", icon=ft.Icons.SAVE_ALT, on_click=download_csv),
                 log_btn,
                 offline_btn,
@@ -1871,7 +2036,7 @@ async def main(page: ft.Page):
         "CO2_FINE": {"charts": [co2_chart, co2fine_chart], "pts": co2fine_pts, "georef": co2fine_georef, "x_key": "CO2_FINE", "color": ft.Colors.CYAN_400},
         "HUMIDITY": {"charts": [climate_chart, hum_chart], "pts": hum_pts, "georef": hum_georef, "x_key": "HUM", "color": ft.Colors.GREEN_400},
         "TEMPERATURE": {"charts": [climate_chart, temp_chart], "pts": temp_pts, "georef": temp_georef, "x_key": "TEMP", "color": ft.Colors.ORANGE_400},
-        "H2S": {"charts": [gas_chart, h2s_chart], "pts": h2s_pts, "georef": h2s_georef, "x_key": "H2S", "color": ft.Colors.YELLOW_400},
+        "H2S": {"charts": [gas_chart, h2s_chart], "pts": h2s_pts, "georef": h2s_georef, "x_key": "H2S", "color": H2S_COLOR},
         "SO2": {"charts": [gas_chart, so2_chart], "pts": so2_pts, "georef": so2_georef, "x_key": "SO2", "color": ft.Colors.RED_400},
     }
     chart_sensor_names = {
@@ -1887,9 +2052,26 @@ async def main(page: ft.Page):
         id(detail_chart): [detail_selection[0]],
     }
 
+    def _latest_x_for_chart(chart):
+        sensor_names = chart_sensor_names[id(chart)]
+        return int(max(
+            (point.x for name in sensor_names for point in sensor_states[name]["pts"]),
+            default=0,
+        ))
+
     def _rebuild_chart_series(chart):
         sensor_names = chart_sensor_names[id(chart)]
-        all_points = [point for name in sensor_names for point in sensor_states[name]["pts"]]
+        state = chart_view_states[id(chart)]
+        window = state["window"]
+        latest_x = _latest_x_for_chart(chart)
+        view_end = latest_x if state["end_x"] is None else min(state["end_x"], latest_x)
+        view_start = max(0, view_end - window + 1)
+        all_points = [
+            point
+            for name in sensor_names
+            for point in sensor_states[name]["pts"]
+            if view_start <= point.x <= view_end
+        ]
         if not all_points:
             chart.data_series = [
                 fch.LineChartData(
@@ -1899,7 +2081,7 @@ async def main(page: ft.Page):
                 for name in sensor_names
             ]
             chart.min_x = 0
-            chart.max_x = MAX_POINTS
+            chart.max_x = window - 1
             chart.min_y = -1
             chart.max_y = 1
             return
@@ -1914,7 +2096,7 @@ async def main(page: ft.Page):
         for name in sensor_names:
             series_state = sensor_states[name]
             series_color = series_state["color"]
-            series_points = series_state["pts"]
+            series_points = [p for p in series_state["pts"] if view_start <= p.x <= view_end]
             if config.get("use_bands", {}).get(name, False) and series_points:
                 latest = series_points[-1].y
                 bands = config.get("bands", {}).get(name, [])
@@ -1925,34 +2107,35 @@ async def main(page: ft.Page):
                 rounded_stroke_cap=True, points=list(series_points),
             ))
         chart.data_series = rebuilt_series
-        max_x = max((p.x for p in all_points), default=MAX_POINTS)
-        chart.min_x = max(0, max_x - MAX_POINTS)
-        chart.max_x = max(MAX_POINTS, max_x)
+        chart.min_x = view_start
+        chart.max_x = max(window - 1, view_end)
         chart.min_y = lo
         chart.max_y = hi
         lbl_color = theme["label_color"]
         chart.left_axis.labels = [
-            fch.ChartAxisLabel(value=lo,  label=ft.Text(f"{lo:.1f}",  size=9, color=lbl_color)),
-            fch.ChartAxisLabel(value=mid, label=ft.Text(f"{mid:.1f}", size=9, color=lbl_color)),
-            fch.ChartAxisLabel(value=hi,  label=ft.Text(f"{hi:.1f}",  size=9, color=lbl_color)),
+            fch.ChartAxisLabel(value=lo,  label=ft.Text(f"{lo:.1f}",  size=11, color=lbl_color)),
+            fch.ChartAxisLabel(value=mid, label=ft.Text(f"{mid:.1f}", size=11, color=lbl_color)),
+            fch.ChartAxisLabel(value=hi,  label=ft.Text(f"{hi:.1f}",  size=11, color=lbl_color)),
         ]
         x_start = int(chart.min_x)
         x_end = int(chart.max_x)
+        x_tick_step = max(1, math.ceil(window / 5))
         chart.bottom_axis.labels = [
             fch.ChartAxisLabel(
                 value=x,
-                label=ft.Text(str(x), size=9, color=lbl_color),
+                label=ft.Text(str(x), size=11, color=lbl_color),
             )
-            for x in range(x_start, x_end + 1, 10)
+            for x in range(x_start, x_end + 1, x_tick_step)
         ]
         if not chart.bottom_axis.labels or chart.bottom_axis.labels[-1].value != x_end:
             chart.bottom_axis.labels.append(
                 fch.ChartAxisLabel(
                     value=x_end,
-                    label=ft.Text(str(x_end), size=9, color=lbl_color),
+                    label=ft.Text(str(x_end), size=11, color=lbl_color),
                 )
             )
         chart.horizontal_grid_lines.interval = max((hi - lo) / 4, 0.1)
+        chart.vertical_grid_lines.interval = x_tick_step
 
     def refresh_secondary_chart(chart):
         """Keep the alternate view current when displayed."""
@@ -1970,9 +2153,6 @@ async def main(page: ft.Page):
             "lon": gps_state["lon"],
             "alt": gps_state["alt"],
         })
-        if len(georef) > MAX_POINTS:
-            georef.pop(0)
-
         tooltip = fch.LineChartDataPointTooltip(
             text=f"X: {xi}\nY: {val:.3f}\nAltitud: {gps_state['alt']:.1f} m",
             text_style=ft.TextStyle(
@@ -1987,9 +2167,6 @@ async def main(page: ft.Page):
             show_tooltip=True,
             tooltip=tooltip,
         ))
-        if len(pts) > MAX_POINTS:
-            pts.pop(0)
-
         grid_chart = state["charts"][1]
         _rebuild_chart_series(grid_chart)
         dirty_charts.add(grid_chart)
@@ -2031,8 +2208,8 @@ async def main(page: ft.Page):
                         interval=active_chart.vertical_grid_lines.interval,
                         color=theme["grid_color"], width=1,
                     ),
-                    left_axis=fch.ChartAxis(show_labels=True, label_size=36, labels=active_chart.left_axis.labels),
-                    bottom_axis=fch.ChartAxis(show_labels=True, label_size=16, labels=active_chart.bottom_axis.labels),
+                    left_axis=fch.ChartAxis(show_labels=True, label_size=44, labels=active_chart.left_axis.labels),
+                    bottom_axis=fch.ChartAxis(show_labels=True, label_size=22, labels=active_chart.bottom_axis.labels),
                     border=ft.Border.all(1, theme["axis_color"]),
                 )
                 dlg.content.content = ft.Column([dlg_chart], expand=True)
@@ -2290,6 +2467,7 @@ async def main(page: ft.Page):
             backoff = min(backoff * 1.5, MAX_BACKOFF)
 
     asyncio.get_event_loop().create_task(mavlink_task())
+    asyncio.get_event_loop().create_task(autosave_loop())
 
 
 if __name__ == "__main__":

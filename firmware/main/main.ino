@@ -4,19 +4,26 @@
 #include <TaskScheduler.h>
 #include <Wire.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define SD_CS_PIN   2
 #define I2C_SDA     22
 #define I2C_SCL     21
 #define H2S_PIN      26
 #define SO2_PIN      27
+// MAX3232 receiver logic output -> GPIO32; common ground, 3.3 V logic.
+// Disconnect the former Gascard shunt/analog connection from the ESP32.
+#define GASCARD_RX_PIN 32
+const float GASCARD_FULL_SCALE_PPM = 3000.0f; // Must match the sensor calibration.
+HardwareSerial Gascard(2);
 
 // Acquisition and publication rates.  Keep the gas acquisition jobs separate
 // so an SEN66 transaction cannot determine the H2S/SO2 sampling cadence.
 #define CO2_READ_INTERVAL_MS      1000
 #define H2S_READ_INTERVAL_MS       250
 #define SO2_READ_INTERVAL_MS       250
-#define PUBLISH_INTERVAL_MS       1000
+#define PUBLISH_INTERVAL_MS        125
 #define TEST_SINE_INTERVAL_MS     2000
 #define SEN66_BOOT_WAIT_MS        1200
 
@@ -38,7 +45,8 @@ uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
 bool sdReady = false;
 File logFile;
-const char* LOG_FILE = "/datalog.csv";
+// Separate file because the RS232 records add three columns.
+const char* LOG_FILE = "/datalog_rs232.csv";
 
 // Sine wave test signal
 const float SINE_PERIOD_MS = 10000.0; // 10 second period for sine wave
@@ -50,9 +58,14 @@ float latestHumidity = NAN;
 float latestCo2 = NAN;
 float latestH2s = NAN;
 float latestSo2 = NAN;
+float latestCo2Fine = NAN;
+float latestGascardTemperatureRaw = NAN; // Internal variable, NOT degrees C.
+float latestGascardPressure = NAN;       // mbar
+float latestGascardHumidity = NAN;       // Protocol field; manual gives no units.
 bool sen66ReadingValid = false;
 bool h2sReadingValid = false;
 bool so2ReadingValid = false;
+bool co2FineReadingValid = false;
 
 Scheduler scheduler;
 
@@ -60,6 +73,7 @@ void finishSen66Startup();
 void readCo2Sensor();
 void readH2sSensor();
 void readSo2Sensor();
+void readCo2FineSensor();
 void publishSensorData();
 void sendTestSine();
 
@@ -83,18 +97,19 @@ void initSD()
   if (!SD.exists(LOG_FILE)) {
     logFile = SD.open(LOG_FILE, FILE_WRITE);
     if (logFile) {
-      logFile.println("timestamp_ms,temperature,humidity,co2_ppm,h2s_ppm,so2_ppm");
+      logFile.println("timestamp_ms,temperature,humidity,co2_ppm,h2s_ppm,so2_ppm,co2_fine_ppm,gascard_temperature_raw,gascard_pressure_mbar,gascard_humidity_raw");
       logFile.close();
-      Serial.println("[SD] Created datalog.csv with header");
+      Serial.println("[SD] Created datalog_rs232.csv with header");
     }
   } else {
-    Serial.println("[SD] Appending to existing datalog.csv");
+    Serial.println("[SD] Appending to existing datalog_rs232.csv");
   }
 
   sdReady = true;
 }
 
-void logToSD(float temperature, float humidity, float co2, float h2s, float so2)
+void logToSD(float temperature, float humidity, float co2, float h2s, float so2,
+             float co2Fine)
 {
   if (!sdReady) return;
 
@@ -115,6 +130,14 @@ void logToSD(float temperature, float humidity, float co2, float h2s, float so2)
   logFile.print(h2s, 2);
   logFile.print(",");
   logFile.print(so2, 2);
+  logFile.print(",");
+  logFile.print(co2Fine, 2);
+  logFile.print(",");
+  logFile.print(latestGascardTemperatureRaw, 0);
+  logFile.print(",");
+  logFile.print(latestGascardPressure, 1);
+  logFile.print(",");
+  logFile.print(latestGascardHumidity, 2);
   logFile.println();
   logFile.close();
 }
@@ -214,7 +237,7 @@ void readCo2Sensor()
     errorToString(error, errorMessage, sizeof(errorMessage));
     Serial.println(errorMessage);
 
-    sen66ReadingValid = false;
+    // Retain the last successful sample while other sensors keep updating.
     return;
   }
 
@@ -236,15 +259,73 @@ void readSo2Sensor()
   so2ReadingValid = true;
 }
 
+// Normal-mode frame: N Conc1 Conc2 Conc3 Conc4 Conc5 Temp Pressure Humidity.
+// The test sketch's "Gascard: " prefix is a debug label, not part of the wire data.
+void parseGascardLine(char* line)
+{
+  char* context = nullptr;
+  char* token = strtok_r(line, " \t", &context);
+  if (!token || strcmp(token, "N") != 0) return;
+
+  float fields[8];
+  for (int i = 0; i < 8; ++i) {
+    token = strtok_r(nullptr, " \t", &context);
+    if (!token) return;
+    char* end = nullptr;
+    fields[i] = strtof(token, &end);
+    if (end == token || *end != '\0' || !isfinite(fields[i])) return;
+  }
+  if (strtok_r(nullptr, " \t", &context)) return;
+
+  const float ppm = fields[0] * GASCARD_FULL_SCALE_PPM;
+  if (!isfinite(ppm)) return;
+  // Commit all four values together only after validating the complete frame.
+  latestCo2Fine = ppm;
+  latestGascardTemperatureRaw = fields[5];
+  latestGascardPressure = fields[6];
+  latestGascardHumidity = fields[7];
+  co2FineReadingValid = true;
+}
+
+void readCo2FineSensor()
+{
+  static char line[192];
+  static size_t length = 0;
+  static bool discardLine = false;
+
+  // Consume only buffered bytes: a partial frame never blocks the scheduler.
+  int remaining = Gascard.available();
+  while (remaining-- > 0) {
+    const char ch = (char)Gascard.read();
+    if (ch == '\r' || ch == '\n') {
+      if (!discardLine && length > 0) {
+        line[length] = '\0';
+        parseGascardLine(line);
+      }
+      length = 0;
+      discardLine = false;
+    } else if (!discardLine) {
+      if (ch == '\0' || length >= sizeof(line) - 1) {
+        discardLine = true; // Resynchronize at the next line ending.
+      } else {
+        line[length++] = ch;
+      }
+    }
+  }
+}
+
 void publishSensorData()
 {
   const unsigned long ms = millis();
 
-  if (!sen66ReadingValid || !h2sReadingValid || !so2ReadingValid) {
-    Serial.println("[DATA] Waiting for initial readings before publishing");
+  if (!sen66ReadingValid || !h2sReadingValid || !so2ReadingValid ||
+      !co2FineReadingValid) {
+    Serial.println("[INFO] Waiting for initial readings before publishing");
     return;
   }
 
+  // Preserve the legacy text format consumed by the Python serial collector.
+  // USB Serial runs at 115200 baud; each sample is one complete line.
   Serial.print("[DATA] ms=");
   Serial.print(ms);
   Serial.print(" | Temp: ");
@@ -252,11 +333,13 @@ void publishSensorData()
   Serial.print("C | Humidity: ");
   Serial.print(latestHumidity, 2);
   Serial.print("% | CO2: ");
-  Serial.print(latestCo2, 2);
+  Serial.print((uint16_t)latestCo2);
   Serial.print(" ppm | H2S: ");
   Serial.print(latestH2s, 2);
   Serial.print(" ppm | SO2: ");
   Serial.print(latestSo2, 2);
+  Serial.print(" ppm | CO2_FINE: ");
+  Serial.print(latestCo2Fine, 2);
   Serial.println(" ppm");
 
   // Keep the existing MAVLink NAMED_VALUE_FLOAT identifiers.
@@ -265,8 +348,15 @@ void publishSensorData()
   sendFloat("CO2", latestCo2);
   sendFloat("H2S", latestH2s);
   sendFloat("SO2", latestSo2);
+  sendFloat("CO2_FINE", latestCo2Fine);
+  // MAVLink names are limited to 10 characters; keep raw fields distinct
+  // from the SEN66 TEMP/HUMIDITY readings.
+  sendFloat("GC_T_RAW", latestGascardTemperatureRaw);
+  sendFloat("GC_PRESS", latestGascardPressure);
+  sendFloat("GC_H_RAW", latestGascardHumidity);
 
-  logToSD(latestTemperature, latestHumidity, latestCo2, latestH2s, latestSo2);
+  logToSD(latestTemperature, latestHumidity, latestCo2, latestH2s, latestSo2,
+          latestCo2Fine);
 }
 
 void sendTestSine()
@@ -280,6 +370,10 @@ void sendTestSine()
 void setup()
 {
   Serial.begin(115200);
+
+  // Same RX-only UART settings as test_scripts/test_max3232. No commands sent.
+  Gascard.setRxBufferSize(2048);
+  Gascard.begin(57600, SERIAL_8N1, GASCARD_RX_PIN, -1);
 
   Serial1.begin(57600, SERIAL_8N1, 16, 17);   // RX, TX
 
@@ -313,5 +407,6 @@ void setup()
 
 void loop()
 {
+  readCo2FineSensor();
   scheduler.execute();
 }
